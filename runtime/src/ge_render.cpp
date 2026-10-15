@@ -3,6 +3,8 @@
 // Register semantics follow PPSSPP's GPU/ge_constants.h and its software
 // renderer (public, GPL); see NOTES.md.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <utility>
 #include <cmath>
@@ -479,6 +481,7 @@ struct Pipe {
 	bool gouraud;
 	int minZ, maxZ;
 	unsigned spec;   // specialisation key (see shade_t), GENERIC for clear/stencil
+	u16 mask16;      // writeMask converted to the 16-bit framebuffer format
 };
 static Pipe P;
 
@@ -539,6 +542,12 @@ static void setup_pipe(bool through) {
 		p.writeMask = (R[0xe8] & 0xFFFFFF) | ((R[0xe9] & 255) << 24);
 	}
 	p.minZ = R[0xd6] & 0xFFFF; p.maxZ = R[0xd7] & 0xFFFF;
+	{
+		u32 mask = p.writeMask;
+		p.mask16 = p.tgt.fmt == 0 ? (u16)(((mask & 0xF8) >> 3) | ((mask & 0xFC00) >> 5) | ((mask & 0xF80000) >> 8))
+		         : p.tgt.fmt == 1 ? (u16)(((mask & 0xF8) >> 3) | ((mask & 0xF800) >> 6) | ((mask & 0xF80000) >> 9) | ((mask >> 31) << 15))
+		                          : (u16)(((mask & 0xF0) >> 4) | ((mask & 0xF000) >> 8) | ((mask & 0xF00000) >> 12) | ((mask & 0xF0000000) >> 16));
+	}
 	if (p.clear || p.stencil) p.spec = F_GENERIC;
 	else p.spec = (p.tex ? F_TEX : 0) | (p.tex && p.texLinear ? F_LINEAR : 0) | (p.fog ? F_FOG : 0) | (p.alphaTest ? F_ATEST : 0) |
 	              (p.depthTest ? F_ZTEST : 0) | (p.blend ? F_BLEND : 0) | (p.tgt.fmt == 3 ? F_FB32 : 0);
@@ -588,7 +597,7 @@ static inline int blend_factor(int f, bool src, int sa, int da, int sc, int dc, 
 #define SPEC(field, bit) ((F & F_GENERIC) ? (field) : ((F & (bit)) != 0))
 
 template <bool LINEAR>
-static inline u32 sample_t(const Pipe &p, float s, float t) {
+__attribute__((always_inline)) static inline u32 sample_t(const Pipe &p, float s, float t) {
 	int mu = p.tw - 1, mv = p.th - 1;
 	auto fetch = [&](int x, int y) -> u32 {
 		x = p.texClampU ? std::clamp(x, 0, mu) : (x & mu);
@@ -616,18 +625,25 @@ static inline u32 fb_read_t(const Target &t, int x, int y) {
 	return fb_read(t, x, y);
 }
 template <unsigned F>
-static inline void fb_write_t(const Target &t, int x, int y, u32 c, u32 mask) {
+__attribute__((always_inline)) static inline void fb_write_t(const Target &t, int x, int y, u32 c, u32 mask, u16 mask16) {
 	if (!(F & F_GENERIC) && (F & F_FB32)) {
 		u32 *q = (u32 *)(t.fb + (y * t.stride + x) * 4);
 		*q = mask ? ((*q & mask) | (c & ~mask)) : c;
 		return;
 	}
-	fb_write(t, x, y, c, mask);
+	if (F & F_GENERIC) { fb_write(t, x, y, c, mask); return; }
+	u32 r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = c >> 24;
+	u16 v;
+	if (t.fmt == 0) v = (r >> 3) | ((g >> 2) << 5) | ((b >> 3) << 11);
+	else if (t.fmt == 1) v = (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >> 7) << 15);
+	else v = (r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8) | ((a >> 4) << 12);
+	u16 *q = (u16 *)(t.fb + (y * t.stride + x) * 2);
+	*q = mask16 ? (u16)((*q & mask16) | (v & ~mask16)) : v;
 }
 
 static thread_local u64 t_pixels;
 template <unsigned F>
-static inline void shade_t(const Pipe &p, int x, int y, float r, float g, float b, float a, float z, float s, float t, float fog) {
+__attribute__((always_inline)) static inline void shade_t(const Pipe &p, int x, int y, float r, float g, float b, float a, float z, float s, float t, float fog) {
 	t_pixels++;
 	int iz = (int)z;
 	if (!p.through && !p.clear && (iz < p.minZ || iz > p.maxZ)) return;
@@ -718,36 +734,27 @@ static inline void shade_t(const Pipe &p, int x, int y, float r, float g, float 
 		}
 	}
 	u32 c = (u32)cr | ((u32)cg << 8) | ((u32)cb << 16) | (outA << 24);
-	fb_write_t<F>(p.tgt, x, y, c, p.writeMask);
+	fb_write_t<F>(p.tgt, x, y, c, p.writeMask, p.mask16);
 }
 
 // ============================================================ rasterisation
 // Each worker rasterises only the rows of its bands, so per-pixel order is kept.
-static const int BAND_SHIFT = 3;
-static inline bool my_row(int y, int tid, int n) { return ((y >> BAND_SHIFT) % n) == tid; }
-// Does [y0, y1] contain any row of this worker's bands?
-static inline bool my_rows(int y0, int y1, int tid, int n) {
-	if (n == 1) return true;
-	int b0 = y0 >> BAND_SHIFT, b1 = y1 >> BAND_SHIFT;
-	if (b1 - b0 + 1 >= n) return true;
-	for (int b = b0; b <= b1; b++) if (b % n == tid) return true;
-	return false;
-}
-
+static const int BAND_SHIFT = 4;           // 16-row bands
+static const int NBANDS = 512 >> BAND_SHIFT;
 template <unsigned F>
-static void raster_sprite_t(const Pipe &P, const Vtx &a, const Vtx &b, int tid, int nth) {
+static void raster_sprite_t(const Pipe &P, const Vtx &a, const Vtx &b, int ylo, int yhi) {
 	float x0 = a.sx, y0 = a.sy, x1 = b.sx, y1 = b.sy;
 	float u0 = a.u, v0 = a.v, u1 = b.u, v1 = b.v;
 	if (x0 > x1) { std::swap(x0, x1); std::swap(u0, u1); }
 	if (y0 > y1) { std::swap(y0, y1); std::swap(v0, v1); }
 	int ix0 = std::max((int)ceilf(x0 - 0.5f), P.sx0), ix1 = std::min((int)ceilf(x1 - 0.5f) - 1, P.sx1);
 	int iy0 = std::max((int)ceilf(y0 - 0.5f), P.sy0), iy1 = std::min((int)ceilf(y1 - 0.5f) - 1, P.sy1);
-	if (iy0 > iy1 || !my_rows(iy0, iy1, tid, nth)) return;
+	iy0 = std::max(iy0, ylo); iy1 = std::min(iy1, yhi);
+	if (iy0 > iy1) return;
 	float du = x1 > x0 ? (u1 - u0) / (x1 - x0) : 0, dv = y1 > y0 ? (v1 - v0) / (y1 - y0) : 0;
 	float sw = P.through ? 1.0f / P.tw : 1.0f, shh = P.through ? 1.0f / P.th : 1.0f;
 	if (!P.tex) sw = shh = 0;
 	for (int y = iy0; y <= iy1; y++) {
-		if (!my_row(y, tid, nth)) continue;
 		float vv = v0 + (y + 0.5f - y0) * dv;
 		for (int x = ix0; x <= ix1; x++) {
 			float uu = u0 + (x + 0.5f - x0) * du;
@@ -757,18 +764,18 @@ static void raster_sprite_t(const Pipe &P, const Vtx &a, const Vtx &b, int tid, 
 }
 
 template <unsigned F>
-static void raster_triangle_t(const Pipe &P, const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx &flat, int tid, int nth) {
+static void raster_triangle_t(const Pipe &P, const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx &flat, int ylo, int yhi) {
 	{
 		int qy0 = std::max((int)floorf(std::min({v0.sy, v1.sy, v2.sy})), P.sy0);
 		int qy1 = std::min((int)ceilf(std::max({v0.sy, v1.sy, v2.sy})), P.sy1);
-		if (qy0 > qy1 || !my_rows(qy0, qy1, tid, nth)) return;
+		if (qy0 > yhi || qy1 < ylo || qy0 > qy1) return;
 	}
 	float area = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v2.sx - v0.sx) * (v1.sy - v0.sy);
 	if (area == 0) return;
 	int minx = std::max((int)floorf(std::min({v0.sx, v1.sx, v2.sx})), P.sx0);
 	int maxx = std::min((int)ceilf(std::max({v0.sx, v1.sx, v2.sx})), P.sx1);
-	int miny = std::max((int)floorf(std::min({v0.sy, v1.sy, v2.sy})), P.sy0);
-	int maxy = std::min((int)ceilf(std::max({v0.sy, v1.sy, v2.sy})), P.sy1);
+	int miny = std::max({(int)floorf(std::min({v0.sy, v1.sy, v2.sy})), P.sy0, ylo});
+	int maxy = std::min({(int)ceilf(std::max({v0.sy, v1.sy, v2.sy})), P.sy1, yhi});
 	if (minx > maxx || miny > maxy) return;
 	float ia = 1.0f / area;
 	float w0 = P.through ? 1 : 1 / v0.w, w1 = P.through ? 1 : 1 / v1.w, w2 = P.through ? 1 : 1 / v2.w;
@@ -784,7 +791,6 @@ static void raster_triangle_t(const Pipe &P, const Vtx &v0, const Vtx &v1, const
 	// edge functions are affine in x: e(x+1) = e(x) + dE
 	float d0 = -(v2.sy - v1.sy) * ia, d1 = -(v0.sy - v2.sy) * ia;
 	for (int y = miny; y <= maxy; y++) {
-		if (!my_row(y, tid, nth)) continue;
 		float py = y + 0.5f, px = minx + 0.5f;
 		float e0 = ((v2.sx - v1.sx) * (py - v1.sy) - (v2.sy - v1.sy) * (px - v1.sx)) * ia;
 		float e1 = ((v0.sx - v2.sx) * (py - v2.sy) - (v0.sy - v2.sy) * (px - v2.sx)) * ia;
@@ -815,13 +821,13 @@ static constexpr std::array<SprFn, sizeof...(Ks)> make_spr(std::integer_sequence
 static const auto s_triFns = make_tri(std::make_integer_sequence<unsigned, 128>{});
 static const auto s_sprFns = make_spr(std::make_integer_sequence<unsigned, 128>{});
 
-static inline void raster_triangle(const Pipe &p, const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &f, int tid, int nth) {
-	if (p.spec == F_GENERIC) raster_triangle_t<F_GENERIC>(p, a, b, c, f, tid, nth);
-	else s_triFns[p.spec](p, a, b, c, f, tid, nth);
+static inline void raster_triangle(const Pipe &p, const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &f, int ylo, int yhi) {
+	if (p.spec == F_GENERIC) raster_triangle_t<F_GENERIC>(p, a, b, c, f, ylo, yhi);
+	else s_triFns[p.spec](p, a, b, c, f, ylo, yhi);
 }
-static inline void raster_sprite(const Pipe &p, const Vtx &a, const Vtx &b, int tid, int nth) {
-	if (p.spec == F_GENERIC) raster_sprite_t<F_GENERIC>(p, a, b, tid, nth);
-	else s_sprFns[p.spec](p, a, b, tid, nth);
+static inline void raster_sprite(const Pipe &p, const Vtx &a, const Vtx &b, int ylo, int yhi) {
+	if (p.spec == F_GENERIC) raster_sprite_t<F_GENERIC>(p, a, b, ylo, yhi);
+	else s_sprFns[p.spec](p, a, b, ylo, yhi);
 }
 
 // ============================================================ deferred, multi-threaded drawing
@@ -864,12 +870,26 @@ static std::vector<Job> s_run_jobs;
 static std::vector<Pipe> s_run_pipes;
 static std::vector<Range> s_run_dirty;
 
+std::atomic<u64> g_raster_px, g_raster_ns;
+static std::vector<u32> s_band[NBANDS], s_run_band[NBANDS];
+static std::atomic<int> s_next_band;
 static void run_jobs(int tid) {
-	for (const Job &j : s_run_jobs) {
-		const Pipe &p = s_run_pipes[j.pipe];
-		if (j.kind == 0) raster_triangle(p, j.v[0], j.v[1], j.v[2], j.v[3], tid, s_nthreads);
-		else raster_sprite(p, j.v[0], j.v[1], tid, s_nthreads);
+	(void)tid;
+	u64 px0 = t_pixels;
+	auto t0 = std::chrono::steady_clock::now();
+	while (true) {
+		int b = s_next_band.fetch_add(1);
+		if (b >= NBANDS) break;
+		int ylo = b << BAND_SHIFT, yhi = ylo + (1 << BAND_SHIFT) - 1;
+		for (u32 idx : s_run_band[b]) {
+			const Job &j = s_run_jobs[idx];
+			const Pipe &p = s_run_pipes[j.pipe];
+			if (j.kind == 0) raster_triangle(p, j.v[0], j.v[1], j.v[2], j.v[3], ylo, yhi);
+			else raster_sprite(p, j.v[0], j.v[1], ylo, yhi);
+		}
 	}
+	g_raster_px += t_pixels - px0;
+	g_raster_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 static void worker_main(int tid) {
@@ -924,6 +944,8 @@ void ge_submit() {
 	s_run_jobs.swap(s_jobs);
 	s_run_pipes.swap(s_pipes);
 	s_run_dirty.swap(s_dirty);
+	for (int b = 0; b < NBANDS; b++) { s_run_band[b].swap(s_band[b]); s_band[b].clear(); }
+	s_next_band = 0;
 	s_jobs.clear();
 	s_pipes.clear();
 	s_dirty.clear();
@@ -951,7 +973,12 @@ static void emit_triangle(const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &f
 	j.pipe = s_pipe_cur;
 	j.kind = 0;
 	j.v[0] = a; j.v[1] = b; j.v[2] = c; j.v[3] = flat;
+	int y0 = std::max((int)floorf(std::min({a.sy, b.sy, c.sy})), P.sy0);
+	int y1 = std::min((int)ceilf(std::max({a.sy, b.sy, c.sy})), P.sy1);
+	if (y0 > y1 || y1 < 0 || y0 > 511) return;
+	u32 idx = (u32)s_jobs.size();
 	s_jobs.push_back(j);
+	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 511) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
 	if (s_jobs.size() >= 4096) ge_submit();
 }
 
@@ -961,7 +988,11 @@ static void draw_sprite(const Vtx &a, const Vtx &b) {
 	j.pipe = s_pipe_cur;
 	j.kind = 1;
 	j.v[0] = a; j.v[1] = b;
+	int y0 = std::max((int)floorf(std::min(a.sy, b.sy)), P.sy0), y1 = std::min((int)ceilf(std::max(a.sy, b.sy)), P.sy1);
+	if (y0 > y1 || y1 < 0 || y0 > 511) return;
+	u32 idx = (u32)s_jobs.size();
 	s_jobs.push_back(j);
+	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 511) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
 }
 
 // Clip a triangle against the near plane (z > -w) in clip space, then rasterise.
@@ -1047,7 +1078,7 @@ static void draw_prim(u32 op) {
 	else s_vaddr += count * f.size * f.nm;
 
 	static double traceAt = getenv("SSX_GETRACE_AT") ? atof(getenv("SSX_GETRACE_AT")) : -1;
-	if (traceAt >= 0 && s_traceState == 0 && rt_time_us() / 1e6 >= traceAt) s_traceState = 1;
+	if (traceAt >= 0 && s_traceState == 0 && (s_prims & 63) == 0 && rt_time_us() / 1e6 >= traceAt) s_traceState = 1;
 	if (s_traceState == 2) ge_flush();
 	u64 px0 = t_pixels;
 	static int dbg = getenv("SSX_GEDEBUG") ? atoi(getenv("SSX_GEDEBUG")) : 0;
@@ -1127,7 +1158,7 @@ void ge_exec_cmd(u32 cmd, u32 op, u32 pc) {
 	switch (cmd) {
 	case 0x01: s_vaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
 	case 0x02: s_iaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
-	case 0x04: { extern u64 g_prof_ge; u64 t0 = rt_time_us(); draw_prim(data); g_prof_ge += rt_time_us() - t0; break; }
+	case 0x04: draw_prim(data); break;
 	case 0x2a: boneN = data; break;
 	case 0x2b: if (boneN < 96) boneM[boneN / 12][boneN % 12] = f24(data); boneN++; break;
 	case 0x2c: case 0x2d: case 0x2e: case 0x2f: case 0x30: case 0x31: case 0x32: case 0x33:

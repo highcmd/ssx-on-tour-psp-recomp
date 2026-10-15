@@ -2,6 +2,7 @@
 // (0x04000000); every vblank we convert it to RGBA and present it.
 #include <SDL2/SDL.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -267,6 +268,16 @@ void display_on_vblank() {
 		if (fr) rt_log(LOG_DISPLAY, "  per frame ms: guest-thread time %.1f (of which GE transform %.1f, raster flush %.1f)",
 		               (g_prof_guest - lg) / 1e3 / fr, (g_prof_ge - lge) / 1e3 / fr, (g_prof_flush - lfl) / 1e3 / fr);
 		lg = g_prof_guest; lge = g_prof_ge; lfl = g_prof_flush;
+		extern u64 g_ge_list_us, g_ge_list_max_us, g_ge_list_count;
+		static u64 llu, llc;
+		if (g_ge_list_count > llc)
+			rt_log(LOG_DISPLAY, "  GE list time avg %.1f ms max %.1f ms", (g_ge_list_us - llu) / 1e3 / (g_ge_list_count - llc), g_ge_list_max_us / 1e3);
+		llu = g_ge_list_us; llc = g_ge_list_count; g_ge_list_max_us = 0;
+		extern std::atomic<u64> g_raster_px, g_raster_ns;
+		static u64 lpx, lns;
+		u64 px = g_raster_px.load(), ns = g_raster_ns.load();
+		if (px > lpx) rt_log(LOG_DISPLAY, "  raster: %.0f px/frame, %.1f ns/px (thread time), %.1f ms worker-time/frame", double(px - lpx) / fr, double(ns - lns) / double(px - lpx), (ns - lns) / 1e6 / fr);
+		lpx = px; lns = ns;
 		extern u64 g_flush_why[8];
 		rt_log(LOG_DISPLAY, "  flush reasons: vram-tex %llu tex-redecode %llu blit %llu", (unsigned long long)g_flush_why[1], (unsigned long long)g_flush_why[2], (unsigned long long)g_flush_why[3]);
 		lastT = now;
