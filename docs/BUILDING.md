@@ -69,13 +69,14 @@ cd ssx-on-tour-psp-recomp
 ./setup.sh ~/Downloads/ssx-on-tour.iso
 ```
 
-The setup takes about a minute on a modern 8-core CPU. It prints each step:
+The setup takes about a minute on a modern 8-core CPU (the Windows build adds a one-time download
+of about 300 MB). It prints each step:
 
 ```
 ==> checking the image
     ULUS-10042, BOOT.BIN 74d1360e3111… OK
-==> extracting the UMD file system to extracted/
-    257 files, 1320 MiB
+==> extracting BOOT.BIN to extracted/
+    3 files, 4 MiB
 ==> analysing BOOT.BIN (function discovery)
 ==> recompiling MIPS to C++ (build/gen)
     10400 functions in 70 files; 0 unhandled instructions; VFPU handlers: 29
@@ -185,8 +186,9 @@ ninja -C build/cmake ssx
 `extracted/PSP_GAME/SYSDIR/BOOT.BIN`. After you edit `data/hooks.json` or `tools/recomp.py`, rerun
 `recomp.py` and `ninja`.
 
-The build is tested with clang. The recompiled code is compiled at `-O1`
-to keep the build time reasonable; the GE renderer (`ge_render.cpp`) is built with `-O3 -march=native`.
+The build is tested with clang (Linux) and llvm-mingw (Windows). The recompiled code is compiled at
+`-O1` to keep the build time reasonable. The software GE renderer (`ge_render.cpp`) is built with
+`-O3 -march=native` on Linux; `-DSSX_NATIVE_ARCH=OFF` turns that off, as the Windows build does.
 
 ## Troubleshooting
 
@@ -195,6 +197,7 @@ to keep the build time reasonable; the GE renderer (`ge_render.cpp`) is built wi
 | `this is not SSX On Tour USA` / `BOOT.BIN has SHA-1 …` | wrong region or a modified image; dump the USA UMD again |
 | `Run tools/recomp.py first` from CMake | `build/gen/` is missing; run `./setup.sh <dump>` |
 | `cannot load …/image.bin` | the checkout moved; rerun `./setup.sh` or pass `--image` |
+| `No UMD image found` (Linux) | the ISO given to `setup.sh` moved; pass `--iso` or set `iso = …` in `run/ssx.ini` |
 | black window, `OpenGL` errors in the log | driver without GL 3.3 core; try `--renderer software` |
 | Windows: `No UMD image found` | put the `.iso` next to `ssx.exe` or set `iso = …` in `ssx.ini` next to it |
 | Windows: SmartScreen warns about `ssx.exe` | the file is unsigned because you built it yourself; choose "More info → Run anyway" |

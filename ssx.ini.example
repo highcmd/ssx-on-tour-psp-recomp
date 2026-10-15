@@ -1,4 +1,5 @@
-# Copy to ssx.ini (in the directory you start ssx from). Command-line flags override these.
+# Copy to ssx.ini: run/ssx.ini on Linux, next to ssx.exe on Windows. Command-line flags override these.
+# All settings: docs/OPTIONS.md
 fps = 60               # 30 (original), 60 or 120
 resolution = 1440x816  # window size; the PSP picture keeps its 480:272 aspect ratio
 renderer = gl          # gl (GPU, default) or software (CPU reference)
@@ -8,3 +9,4 @@ filter = linear        # linear (smooth) or nearest (sharp pixels)
 vsync = false
 deadzone = 8000        # gamepad left-stick deadzone, 0..32767
 right_stick_dpad = false
+# iso = D:\Games\SSX On Tour.iso   # your UMD image, if it is not next to ssx.exe / given to setup
