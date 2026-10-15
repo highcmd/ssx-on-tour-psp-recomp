@@ -1,0 +1,90 @@
+#pragma once
+// Minimal OpenGL 3.3 core loader (function pointers resolved with SDL_GL_GetProcAddress).
+#include <GL/glcorearb.h>
+
+#define SSX_GL_FUNCS(X) \
+	X(PFNGLGETSTRINGPROC, glGetString) \
+	X(PFNGLGETSTRINGIPROC, glGetStringi) \
+	X(PFNGLGETINTEGERVPROC, glGetIntegerv) \
+	X(PFNGLGETERRORPROC, glGetError) \
+	X(PFNGLENABLEPROC, glEnable) \
+	X(PFNGLDISABLEPROC, glDisable) \
+	X(PFNGLVIEWPORTPROC, glViewport) \
+	X(PFNGLSCISSORPROC, glScissor) \
+	X(PFNGLCLEARCOLORPROC, glClearColor) \
+	X(PFNGLCLEARDEPTHPROC, glClearDepth) \
+	X(PFNGLCLEARSTENCILPROC, glClearStencil) \
+	X(PFNGLCLEARPROC, glClear) \
+	X(PFNGLCOLORMASKPROC, glColorMask) \
+	X(PFNGLDEPTHMASKPROC, glDepthMask) \
+	X(PFNGLDEPTHFUNCPROC, glDepthFunc) \
+	X(PFNGLSTENCILFUNCPROC, glStencilFunc) \
+	X(PFNGLSTENCILOPPROC, glStencilOp) \
+	X(PFNGLSTENCILMASKPROC, glStencilMask) \
+	X(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate) \
+	X(PFNGLBLENDEQUATIONSEPARATEPROC, glBlendEquationSeparate) \
+	X(PFNGLBLENDCOLORPROC, glBlendColor) \
+	X(PFNGLGENTEXTURESPROC, glGenTextures) \
+	X(PFNGLDELETETEXTURESPROC, glDeleteTextures) \
+	X(PFNGLBINDTEXTUREPROC, glBindTexture) \
+	X(PFNGLTEXIMAGE2DPROC, glTexImage2D) \
+	X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D) \
+	X(PFNGLTEXPARAMETERIPROC, glTexParameteri) \
+	X(PFNGLACTIVETEXTUREPROC, glActiveTexture) \
+	X(PFNGLGENSAMPLERSPROC, glGenSamplers) \
+	X(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri) \
+	X(PFNGLBINDSAMPLERPROC, glBindSampler) \
+	X(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers) \
+	X(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers) \
+	X(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer) \
+	X(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D) \
+	X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
+	X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer) \
+	X(PFNGLREADPIXELSPROC, glReadPixels) \
+	X(PFNGLPIXELSTOREIPROC, glPixelStorei) \
+	X(PFNGLGENBUFFERSPROC, glGenBuffers) \
+	X(PFNGLBINDBUFFERPROC, glBindBuffer) \
+	X(PFNGLBUFFERDATAPROC, glBufferData) \
+	X(PFNGLBUFFERSUBDATAPROC, glBufferSubData) \
+	X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
+	X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray) \
+	X(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer) \
+	X(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray) \
+	X(PFNGLDRAWARRAYSPROC, glDrawArrays) \
+	X(PFNGLCREATESHADERPROC, glCreateShader) \
+	X(PFNGLSHADERSOURCEPROC, glShaderSource) \
+	X(PFNGLCOMPILESHADERPROC, glCompileShader) \
+	X(PFNGLGETSHADERIVPROC, glGetShaderiv) \
+	X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog) \
+	X(PFNGLCREATEPROGRAMPROC, glCreateProgram) \
+	X(PFNGLATTACHSHADERPROC, glAttachShader) \
+	X(PFNGLLINKPROGRAMPROC, glLinkProgram) \
+	X(PFNGLGETPROGRAMIVPROC, glGetProgramiv) \
+	X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog) \
+	X(PFNGLUSEPROGRAMPROC, glUseProgram) \
+	X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation) \
+	X(PFNGLUNIFORM1IPROC, glUniform1i) \
+	X(PFNGLUNIFORM1FPROC, glUniform1f) \
+	X(PFNGLUNIFORM2FPROC, glUniform2f) \
+	X(PFNGLUNIFORM3FPROC, glUniform3f) \
+	X(PFNGLUNIFORM4FPROC, glUniform4f) \
+	X(PFNGLUNIFORM4IPROC, glUniform4i) \
+	X(PFNGLFENCESYNCPROC, glFenceSync) \
+	X(PFNGLWAITSYNCPROC, glWaitSync) \
+	X(PFNGLCLIENTWAITSYNCPROC, glClientWaitSync) \
+	X(PFNGLDELETESYNCPROC, glDeleteSync) \
+	X(PFNGLFLUSHPROC, glFlush) \
+	X(PFNGLFINISHPROC, glFinish) \
+	X(PFNGLGETTEXIMAGEPROC, glGetTexImage)
+
+#define SSX_GL_DECLARE(type, name) extern type ssx_##name;
+SSX_GL_FUNCS(SSX_GL_DECLARE)
+#undef SSX_GL_DECLARE
+
+#ifndef SSX_GL_NO_MACROS
+#define SSX_GL_ALIAS(type, name) /* name -> ssx_name */
+#include "gl_aliases.h"
+#endif
+
+// Returns false if any function is missing.
+bool gl_load_functions();

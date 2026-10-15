@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "kernel.h"
+#include "ge_gl.h"
 #include "settings.h"
 
 static SDL_Window *s_win;
@@ -23,6 +24,7 @@ static int s_tex_scale = 1;
 const u32 *ge_shadow_for_display(u32 fbAddr, u32 *stride, int *scale);
 extern int g_render_scale;
 static bool s_headless;
+static bool s_gl;   // OpenGL renderer + present thread
 
 static std::vector<SDL_GameController *> s_pads;
 
@@ -37,7 +39,9 @@ static void open_pad(int index) {
 
 void display_init(bool headless) {
 	s_headless = headless;
-	if (headless) {
+	const Settings &st = g_settings;
+	bool wantGL = st.renderer == "gl";
+	if (headless && !wantGL) {
 		s_tex_scale = g_render_scale;
 		s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
 		return;
@@ -48,20 +52,35 @@ void display_init(bool headless) {
 		s_headless = true;
 		return;
 	}
-	const Settings &st = g_settings;
 	if (!st.padMapping.empty() && SDL_GameControllerAddMapping(st.padMapping.c_str()) < 0)
 		rt_log_error("pad_mapping rejected: %s", SDL_GetError());
-	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, st.linear ? "1" : "0");
-	u32 flags = SDL_WINDOW_RESIZABLE | (st.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, st.width, st.height, flags);
-	s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED | (st.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
-	SDL_RenderSetLogicalSize(s_ren, 480, 272);   // keeps the PSP aspect ratio (letterbox)
 	g_render_scale = settings_render_scale();
-	s_tex_scale = g_render_scale;
-	s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
-	s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480 * s_tex_scale, 272 * s_tex_scale);
+	u32 flags = SDL_WINDOW_RESIZABLE | (st.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	if (wantGL) {
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+		SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+		SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+		SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+		flags |= SDL_WINDOW_OPENGL | (headless ? SDL_WINDOW_HIDDEN : 0);
+	}
+	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, st.width, st.height, flags);
+	if (wantGL && s_win && gl_display_init(s_win, headless, st.vsync, st.linear)) {
+		s_gl = true;
+	} else {
+		if (wantGL) rt_log_error("OpenGL renderer unavailable; falling back to the software renderer");
+		if (headless) { s_headless = true; s_tex_scale = g_render_scale; s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0); return; }
+		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, st.linear ? "1" : "0");
+		s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED | (st.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
+		SDL_RenderSetLogicalSize(s_ren, 480, 272);   // keeps the PSP aspect ratio (letterbox)
+		s_tex_scale = g_render_scale;
+		s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
+		s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480 * s_tex_scale, 272 * s_tex_scale);
+	}
 	for (int i = 0; i < SDL_NumJoysticks(); i++) open_pad(i);
-	rt_log(LOG_DISPLAY, "internal resolution %dx%d (render scale %d)", 480 * g_render_scale, 272 * g_render_scale, g_render_scale);
+	rt_log(LOG_DISPLAY, "%s renderer, internal resolution %dx%d (render scale %d)", s_gl ? "OpenGL" : "software",
+	       480 * g_render_scale, 272 * g_render_scale, g_render_scale);
 	rt_log(LOG_DISPLAY, "window %dx%d%s, filter %s, vsync %s, fps mode %d, %zu gamepad(s)", st.width, st.height,
 	       st.fullscreen ? " fullscreen" : "", st.linear ? "linear" : "nearest", st.vsync ? "on" : "off", st.fps, s_pads.size());
 }
@@ -138,6 +157,16 @@ void display_present() {
 	static int shot = 0;
 	if (!s_fb_addr) return;
 	bool wantShot = every > 0 && rt_time_us() / 1e6 >= next;
+	if (s_gl) {
+		gl_display_present(s_fb_addr, s_fb_width, s_fb_fmt);
+		if (wantShot) {
+			char name[64];
+			snprintf(name, sizeof(name), "shot_%03d.ppm", shot++);
+			gl_display_screenshot(name);
+			next += every;
+		}
+		return;
+	}
 	if (s_headless && !wantShot) return;
 	convert_fb();
 	if (wantShot) {

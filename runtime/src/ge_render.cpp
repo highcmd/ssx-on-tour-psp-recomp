@@ -13,11 +13,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <pthread.h>
 #include <unordered_map>
 #include <vector>
 
+#include "ge_gl.h"
 #include "kernel.h"
 
 // ============================================================ state
@@ -35,7 +37,9 @@ extern int g_render_scale;
 static inline float f24(u32 v) { u32 b = v << 8; float f; memcpy(&f, &b, 4); return f; }
 static inline bool on(u32 cmd) { return R[cmd] & 1; }
 
+std::map<std::string, u64> g_gestats;
 void ge_dump_stats() {
+	for (auto &[k, v] : g_gestats) rt_log(LOG_GE, "  %8llu  %s", (unsigned long long)v, k.c_str());
 	extern u64 g_cmd_hist[256];
 	for (int i = 0; i < 256; i++) if (g_cmd_hist[i] > 1000000) rt_log(LOG_GE, "  cmd %02x: %llu", i, (unsigned long long)g_cmd_hist[i]);
 	rt_log(LOG_GE, "GE: %llu prims", (unsigned long long)s_prims);
@@ -299,7 +303,9 @@ struct DecodedTex {
 	std::vector<u32> px;   // RGBA8 (0xAABBGGRR)
 	u64 hash = 0;
 	u64 clutHash = 0;
+	GLTexRef gl;           // GPU copy (GL renderer)
 };
+static DecodedTex *s_lastTex;   // entry returned by the last get_texture()
 static std::unordered_map<u64, DecodedTex> s_texcache;
 static u64 s_clut_hash;
 
@@ -335,47 +341,60 @@ static inline u32 texel_offset(u32 x, u32 y, u32 bufw, int bits, bool swz) {
 	return ((y >> 3) * blocksPerRow + (bx >> 4)) * 128 + (y & 7) * 16 + (bx & 15);
 }
 
+// PSP DXT blocks put the colour part FIRST (lines[4], color1, color2), then
+// the alpha part (DXT3: 4 x u16 rows of 4-bit alpha; DXT5: u32 + u16 = 48 bits
+// of 3-bit indices, then alpha1, alpha2). Layout per PPSSPP TextureDecoder.
 static void decode_dxt(const TexInfo &t, std::vector<u32> &out) {
 	int bw = std::max<u32>(t.bufw, 4) / 4;
 	int blockBytes = t.fmt == 8 ? 8 : 16;
-	for (u32 by = 0; by < t.h / 4 + (t.h < 4); by++)
-		for (u32 bx = 0; bx < t.w / 4 + (t.w < 4); bx++) {
+	for (u32 by = 0; by < (t.h + 3) / 4; by++)
+		for (u32 bx = 0; bx < (t.w + 3) / 4; bx++) {
 			const u8 *b = gptr(t.addr + (by * bw + bx) * blockBytes);
-			const u8 *cb = t.fmt == 8 ? b : b + 8;  // DXT3/5: color block after alpha
 			u16 c1, c2;
-			memcpy(&c1, cb + 4, 2);
-			memcpy(&c2, cb + 6, 2);
+			memcpy(&c1, b + 4, 2);
+			memcpy(&c2, b + 6, 2);
 			int r1 = (c1 >> 8) & 0xF8, g1 = (c1 >> 3) & 0xFC, b1 = (c1 << 3) & 0xF8;
 			int r2 = (c2 >> 8) & 0xF8, g2 = (c2 >> 3) & 0xFC, b2 = (c2 << 3) & 0xF8;
 			u32 a = t.fmt == 8 ? 0xFF000000u : 0;
-			auto mk = [&](int r, int g, int bb) { return a | (bb << 16) | (g << 8) | r; };
+			auto mk = [&](int r, int g, int bb) { return a | ((u32)bb << 16) | ((u32)g << 8) | (u32)r; };
 			u32 cols[4] = {mk(r1, g1, b1), mk(r2, g2, b2), 0, 0};
-			if (c1 > c2 || t.fmt != 8) {
+			if (c1 > c2) {
 				cols[2] = mk((2 * r1 + r2) / 3, (2 * g1 + g2) / 3, (2 * b1 + b2) / 3);
 				cols[3] = mk((r1 + 2 * r2) / 3, (g1 + 2 * g2) / 3, (b1 + 2 * b2) / 3);
 			} else {
 				cols[2] = mk((r1 + r2) / 2, (g1 + g2) / 2, (b1 + b2) / 2);
 				cols[3] = 0;
 			}
+			// DXT5 alpha palette
+			u8 alpha[8] = {0};
+			u64 aidx = 0;
+			if (t.fmt == 10) {
+				u32 lo; u16 hi;
+				memcpy(&lo, b + 8, 4);
+				memcpy(&hi, b + 12, 2);
+				aidx = ((u64)hi << 32) | lo;
+				int a1 = b[14], a2 = b[15];
+				alpha[0] = (u8)a1; alpha[1] = (u8)a2;
+				if (a1 > a2) {
+					for (int n = 1; n <= 6; n++) alpha[n + 1] = (u8)((a1 * ((7 - n) << 8) / 7 + a2 * (n << 8) / 7 + 31) >> 8);
+				} else {
+					for (int n = 1; n <= 4; n++) alpha[n + 1] = (u8)((a1 * ((5 - n) << 8) / 5 + a2 * (n << 8) / 5 + 31) >> 8);
+					alpha[6] = 0;
+					alpha[7] = 255;
+				}
+			}
 			for (int y = 0; y < 4; y++) {
 				u32 py = by * 4 + y;
 				if (py >= t.h) break;
-				u8 line = cb[y];
+				u8 line = b[y];
+				u16 arow = 0;
+				if (t.fmt == 9) memcpy(&arow, b + 8 + y * 2, 2);
+				u32 arow5 = (u32)(aidx >> (y * 12));
 				for (int x = 0; x < 4; x++) {
 					u32 pxx = bx * 4 + x;
 					u32 c = cols[(line >> (2 * x)) & 3];
-					if (t.fmt == 9) {  // DXT3: 4-bit explicit alpha, 8 bytes, row of 4 = u16
-						u16 arow; memcpy(&arow, b + y * 2, 2);
-						c = (c & 0xFFFFFF) | (((arow >> (4 * x)) & 15) * 17u << 24);
-					} else if (t.fmt == 10) {  // DXT5: interpolated alpha
-						u8 a0 = b[6], a1 = b[7];
-						u64 bits = 0; memcpy(&bits, b, 6);
-						int code = (bits >> (3 * (y * 4 + x))) & 7;
-						int av;
-						if (a0 > a1) av = code == 0 ? a0 : code == 1 ? a1 : ((8 - code) * a0 + (code - 1) * a1) / 7;
-						else av = code == 0 ? a0 : code == 1 ? a1 : code == 6 ? 0 : code == 7 ? 255 : ((6 - code) * a0 + (code - 1) * a1) / 5;
-						c = (c & 0xFFFFFF) | ((u32)av << 24);
-					}
+					if (t.fmt == 9) c = (c & 0xFFFFFF) | (((arow >> (4 * x)) & 15) << 28);
+					else if (t.fmt == 10) c = (c & 0xFFFFFF) | ((u32)alpha[(arow5 >> (3 * x)) & 7] << 24);
 					if (pxx < t.w) out[py * t.w + pxx] = c;
 				}
 			}
@@ -407,13 +426,29 @@ static const u32 *get_texture(const TexInfo &t) {
 	u64 key = ((u64)t.addr << 32) ^ ((u64)t.fmt << 28) ^ ((u64)t.w << 16) ^ ((u64)t.h << 4) ^ ((u64)t.bufw << 40) ^ t.swz;
 	u64 h = hash_bytes(gptr(t.addr), std::min<size_t>(bytes, 0x200000));
 	DecodedTex &d = s_texcache[key];
+	s_lastTex = &d;
 	if (!d.px.empty() && d.hash == h && (!isClut || d.clutHash == s_clut_hash)) return d.px.data();
 	if (jobs_pending()) g_flush_why[2]++;
 	ge_flush();   // queued draws may still sample the old decode of this entry
 	d.px.assign((size_t)t.w * t.h, 0);
 	d.hash = h;
 	d.clutHash = s_clut_hash;
+	struct DumpAtEnd { const TexInfo &t; DecodedTex &d; ~DumpAtEnd() {
+		static bool on = getenv("SSX_TEXDUMP") != nullptr;
+		if (!on || (t.fmt < 8 && rt_time_us() < 40000000)) return;
+		static std::map<u64, bool> done;
+		u64 k = ((u64)t.addr << 8) ^ t.fmt;
+		if (done[k]) return;
+		done[k] = true;
+		char nm[96];
+		snprintf(nm, sizeof(nm), "tex_%08x_f%u_%ux%u_s%d.ppm", t.addr, t.fmt, t.w, t.h, (int)t.swz);
+		FILE *f = fopen(nm, "wb");
+		fprintf(f, "P6\n%u %u\n255\n", t.w, t.h);
+		for (u32 i = 0; i < t.w * t.h; i++) { u32 c = d.px[i]; u8 px[3] = {(u8)c, (u8)(c >> 8), (u8)(c >> 16)}; fwrite(px, 1, 3, f); }
+		fclose(f);
+	} } dumper{t, d};
 	if (t.fmt >= 8) { decode_dxt(t, d.px); return d.px.data(); }
+
 	const u8 *base = gptr(t.addr);
 	for (u32 y = 0; y < t.h; y++)
 		for (u32 x = 0; x < t.w; x++) {
@@ -588,6 +623,7 @@ static Shadow *shadow_covering(u32 vaddr, u32 size) {
 // End of a frame (FINISH): bring VRAM up to date with everything drawn, so a
 // stale shadow can never overwrite memory the game reuses later.
 void ge_resolve_all() {
+	if (gl_backend_active()) { gl_ge_frame_done(); return; }
 	if (g_render_scale <= 1) return;
 	std::vector<Shadow *> todo;
 	{
@@ -619,7 +655,7 @@ static Target current_target() {
 	t.vfmt = R[0xd2] & 3;
 	if (!t.vstride) t.vstride = 512;
 	if (!t.vzstride) t.vzstride = 512;
-	if (g_render_scale <= 1) {
+	if (g_render_scale <= 1 || gl_backend_active()) {
 		t.fb = gptr(t.vfb);
 		t.zb = (u16 *)gptr(t.vzb);
 		t.stride = t.vstride; t.zstride = t.vzstride; t.fmt = t.vfmt;
@@ -662,8 +698,12 @@ struct Pipe {
 	unsigned spec;   // specialisation key (see shade_t), GENERIC for clear/stencil
 	u16 mask16;      // writeMask converted to the 16-bit framebuffer format
 	struct Shadow *shadow = nullptr;   // colour shadow being drawn into (render scale > 1)
+	DecodedTex *texEntry = nullptr;    // GL renderer: texture cache entry
+	u64 texVersion = 0;
+	u32 fboTexAddr = 0;                // GL renderer: sample this render target
 };
 static Pipe P;
+static std::mutex s_stats_mtx;
 
 static inline bool cmp(int func, u32 a, u32 b) {
 	switch (func) {
@@ -699,7 +739,27 @@ static void setup_pipe(bool through) {
 		t.swz = R[0xc2] & 1;
 		if (t.fmt > 10) t.fmt = 3;
 		if (!t.bufw) t.bufw = t.w;
-		p.texels = get_texture(t);
+		p.fboTexAddr = 0;
+		p.texEntry = nullptr;
+		if (getenv("SSX_RTTDBG") && gl_backend_active() && (t.addr & 0x0F000000) == 0x04000000) {
+			u32 b, st, fm;
+			if (gl_find_color_target(t.addr, &b, &st, &fm)) {
+				static std::map<u64, int> seen;
+				u64 key = ((u64)t.addr << 8) ^ t.fmt ^ ((u64)p.tgt.vfb << 40);
+				if (seen[key]++ == 0)
+					rt_log(LOG_GE, "RTT? tex %08x fmt %u %ux%u bufw %u inside target %08x stride %u fmt %u (+%x) | drawing into %08x",
+					       t.addr, t.fmt, t.w, t.h, t.bufw, b, st, fm, (t.addr & 0x0FFFFFFF) - b, p.tgt.vfb);
+			}
+		}
+		if (gl_backend_active() && (t.addr & 0x0F000000) == 0x04000000 && t.fmt <= 3 &&
+		    (t.addr & 0x0FFFFFFF) != (p.tgt.vfb & 0x0FFFFFFF) && gl_has_color_target(t.addr)) {
+			p.fboTexAddr = t.addr & 0x0FFFFFFF;   // render-to-texture: sample the GPU target
+			p.texels = nullptr;
+		} else {
+			p.texels = get_texture(t);
+			p.texEntry = s_lastTex;
+			p.texVersion = s_lastTex ? (s_lastTex->hash ^ (s_lastTex->clutHash * 0x9E3779B97F4A7C15ull)) : 0;
+		}
 		p.tw = t.w; p.th = t.h;
 		p.texClampU = R[0xc7] & 1; p.texClampV = R[0xc7] & 0x100;
 		p.texLinear = (R[0xc6] >> 8) & 1;
@@ -712,7 +772,7 @@ static void setup_pipe(bool through) {
 	p.atFunc = R[0xdb] & 7; p.atRef = (R[0xdb] >> 8) & 255; p.atMask = (R[0xdb] >> 16) & 255;
 	p.depthTest = !p.clear && on(0x23);
 	p.zFunc = R[0xde] & 7;
-	p.zWrite = p.clear ? p.clearDepth : !(R[0xe7] & 1);
+	p.zWrite = p.clear ? p.clearDepth : (on(0x23) && !(R[0xe7] & 1));   // no Z writes without the depth test
 	p.blend = !p.clear && on(0x21);
 	p.bSrc = R[0xdf] & 15; p.bDst = (R[0xdf] >> 4) & 15; p.bEq = (R[0xdf] >> 8) & 7;
 	p.fixA = R[0xe0]; p.fixB = R[0xe1];
@@ -739,6 +799,26 @@ static void setup_pipe(bool through) {
 		p.mask16 = p.tgt.fmt == 0 ? (u16)(((mask & 0xF8) >> 3) | ((mask & 0xFC00) >> 5) | ((mask & 0xF80000) >> 8))
 		         : p.tgt.fmt == 1 ? (u16)(((mask & 0xF8) >> 3) | ((mask & 0xF800) >> 6) | ((mask & 0xF80000) >> 9) | ((mask >> 31) << 15))
 		                          : (u16)(((mask & 0xF0) >> 4) | ((mask & 0xF000) >> 8) | ((mask & 0xF00000) >> 12) | ((mask & 0xF0000000) >> 16));
+	}
+	if (getenv("SSX_GESTATS")) {
+		extern std::map<std::string, u64> g_gestats;
+		char k[256];
+		snprintf(k, sizeof(k), "STST %06x SOP %06x ste %d ", R[0xdc], R[0xdd], p.stencil);
+		std::string extra = k;
+		snprintf(k, sizeof(k), "clear%d thr%d tex%d fmt%u func%u rgba%d dbl%d lin%d clamp%d%d | at%d f%u ref%u | zt%d f%u zw%d | bl%d %u/%u eq%u fix %06x/%06x | st%d ct%d lop%d | fb%u fog%d mask%08x",
+		         p.clear, through, p.tex, R[0xc3] & 15, p.texFunc, p.texRGBA, p.colorDouble, p.texLinear, p.texClampU, p.texClampV,
+		         p.alphaTest, p.atFunc, p.atRef, p.depthTest, p.zFunc, p.zWrite, p.blend, p.bSrc, p.bDst, p.bEq, p.fixA, p.fixB,
+		         p.stencil, on(0x27), on(0x28), p.tgt.vfmt, p.fog, p.writeMask);
+		std::lock_guard<std::mutex> lk(s_stats_mtx);
+		g_gestats[(p.stencil || (p.blend && (p.bSrc == 4 || p.bSrc == 5 || p.bDst == 4 || p.bDst == 5 || p.bSrc == 8 || p.bDst == 8)) ? extra : std::string()) + k]++;
+		if (p.tex) {
+			u32 ta = (R[0xa0] & 0xFFFFF0) | ((R[0xa8] & 0x0F0000) << 8);
+			if ((ta & 0x0F000000) == 0x04000000) {
+				snprintf(k, sizeof(k), "VRAMTEX addr %06x fmt %u %ux%u bufw %u | fb %06x stride %u fmt %u", ta & 0x1FFFFF, R[0xc3] & 15,
+				         1u << (R[0xb8] & 15), 1u << ((R[0xb8] >> 8) & 15), R[0xa8] & 0xFFFF, p.tgt.vfb & 0x1FFFFF, p.tgt.vstride, p.tgt.vfmt);
+				g_gestats[k]++;
+			}
+		}
 	}
 	if (p.clear || p.stencil) p.spec = F_GENERIC;
 	else p.spec = (p.tex ? F_TEX : 0) | (p.tex && p.texLinear ? F_LINEAR : 0) | (p.fog ? F_FOG : 0) | (p.alphaTest ? F_ATEST : 0) |
@@ -1134,8 +1214,10 @@ static bool running_overlap(u32 addr, u32 size) {
 u64 g_ge_flushes, g_ge_jobs;
 u64 g_flush_why[8];
 
+static void gl_flush_jobs();
 // Hand the current batch to the raster workers and return (they run while we build the next).
 void ge_submit() {
+	if (gl_backend_active()) { gl_flush_jobs(); return; }
 	if (s_jobs.empty()) { s_pipes.clear(); s_dirty.clear(); s_pipe_cur = -1; return; }
 	if (s_nthreads == 0) {
 		const char *e = getenv("SSX_GE_THREADS");
@@ -1165,6 +1247,7 @@ void ge_submit() {
 
 // Full sync: everything queued so far is in guest memory when this returns.
 void ge_flush() {
+	if (gl_backend_active()) { gl_flush_jobs(); return; }
 	extern u64 g_prof_flush;
 	u64 t0 = rt_time_us();
 	ge_submit();
@@ -1211,6 +1294,90 @@ static void draw_sprite(const Vtx &a, const Vtx &b) {
 	s_jobs.push_back(j);
 	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 512 * g_render_scale - 1) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
 	note_drawn(std::min(a.sx, b.sx), y0, std::max(a.sx, b.sx), y1);
+}
+
+
+// ============================================================ GL renderer: jobs -> GPU draws
+static GLDrawState gl_state_for(const Pipe &p) {
+	GLDrawState st{};
+	st.fbAddr = p.tgt.vfb & 0x0FFFFFFF;
+	st.fbStride = p.tgt.vstride;
+	st.fbFmt = p.tgt.vfmt;
+	st.zbAddr = p.tgt.vzb & 0x0FFFFFFF;
+	st.sx0 = p.sx0; st.sy0 = p.sy0; st.sx1 = p.sx1; st.sy1 = p.sy1;
+	st.clear = p.clear; st.clearColor = p.clearColor; st.clearAlpha = p.clearAlpha; st.clearDepth = p.clearDepth;
+	st.tex = p.tex;
+	st.texRef = p.texEntry ? &p.texEntry->gl : nullptr;
+	st.texPixels = p.texels;
+	st.texW = p.tw; st.texH = p.th;
+	st.texVersion = p.texVersion;
+	st.fboTexAddr = p.fboTexAddr;
+	st.texLinear = p.texLinear; st.clampU = p.texClampU; st.clampV = p.texClampV;
+	st.texFunc = p.texFunc; st.texRGBA = p.texRGBA; st.colorDouble = p.colorDouble; st.texEnv = p.texEnv;
+	st.fog = p.fog; st.fogColor = p.fogColor;
+	st.alphaTest = p.alphaTest; st.atFunc = p.atFunc; st.atRef = p.atRef; st.atMask = p.atMask;
+	st.depthTest = p.depthTest; st.zFunc = p.zFunc; st.zWrite = p.zWrite;
+	st.rangeTest = !p.through && !p.clear && (p.minZ > 0 || p.maxZ < 65535);
+	st.minZ = p.minZ; st.maxZ = p.maxZ;
+	st.blend = p.blend; st.bSrc = p.bSrc; st.bDst = p.bDst; st.bEq = p.bEq; st.fixA = p.fixA; st.fixB = p.fixB;
+	st.stencil = p.stencil; st.stFunc = p.stFunc; st.stRef = p.stRef; st.stMask = p.stMask;
+	st.sFail = p.sFail; st.sZFail = p.sZFail; st.sZPass = p.sZPass;
+	st.writeMask = p.writeMask;
+	return st;
+}
+
+static inline u32 pack_color(float r, float g, float b, float a) {
+	auto c = [](float v) { return (u32)std::clamp((int)(v + 0.5f), 0, 255); };
+	return c(r) | (c(g) << 8) | (c(b) << 16) | (c(a) << 24);
+}
+
+static inline GLVert gl_vert(const Pipe &p, const Vtx &a, const Vtx &col, bool persp, float fog, float sz) {
+	float T = (float)gl_target_width();
+	float w = persp ? std::max(a.w, 1e-6f) : 1.0f;
+	float xn = 2.0f * a.sx / T - 1.0f, yn = 2.0f * a.sy / T - 1.0f, zn = 2.0f * (sz / 65535.0f) - 1.0f;
+	GLVert g;
+	g.x = xn * w; g.y = yn * w; g.z = zn * w; g.w = w;
+	g.u = a.u; g.v = a.v;
+	if (p.through && p.tex && p.tw && p.th) { g.u /= (float)p.tw; g.v /= (float)p.th; }
+	g.color = pack_color(col.r, col.g, col.b, col.a);
+	g.fog = fog;
+	return g;
+}
+
+static void gl_flush_jobs() {
+	static std::vector<GLVert> verts;
+	size_t i = 0;
+	while (i < s_jobs.size()) {
+		u32 pi = s_jobs[i].pipe;
+		const Pipe &p = s_pipes[pi];
+		verts.clear();
+		size_t j = i;
+		for (; j < s_jobs.size() && s_jobs[j].pipe == pi; j++) {
+			const Job &jb = s_jobs[j];
+			if (jb.kind == 0) {
+				bool persp = !p.through;
+				for (int k = 0; k < 3; k++) {
+					const Vtx &col = p.gouraud ? jb.v[k] : jb.v[3];
+					verts.push_back(gl_vert(p, jb.v[k], col, persp, jb.v[k].fog, jb.v[k].sz));
+				}
+			} else {
+				// sprite: colour, depth and fog of the second vertex, texcoords from both corners
+				const Vtx &a = jb.v[0], &b = jb.v[1];
+				Vtx c00 = a, c10 = a, c01 = a, c11 = b;
+				c10.sx = b.sx; c10.u = b.u;
+				c01.sy = b.sy; c01.v = b.v;
+				const Vtx *quad[6] = {&c00, &c10, &c01, &c10, &c11, &c01};
+				for (const Vtx *q : quad) verts.push_back(gl_vert(p, *q, b, false, b.fog, b.sz));
+			}
+		}
+		gl_ge_draw(gl_state_for(p), verts.data(), (int)verts.size());
+		i = j;
+	}
+	s_jobs.clear();
+	s_pipes.clear();
+	s_dirty.clear();
+	for (int b = 0; b < NBANDS; b++) s_band[b].clear();
+	s_pipe_cur = -1;
 }
 
 // Clip a triangle against the near plane (z > -w) in clip space, then rasterise.
@@ -1346,6 +1513,12 @@ static void draw_prim(u32 op) {
 		if (!f.through) to_screen(a);
 		if (P.clear || type == 4) rt_log(LOG_GE, "T   viewport z: scale %f pos %f  minz %u maxz %u  zbuf %p clearDepth %d v0.sz %.1f",
 		       f24(R[0x44]), f24(R[0x47]), R[0xd6] & 0xFFFF, R[0xd7] & 0xFFFF, (void *)P.tgt.zb, P.clearDepth, a.sz);
+		{
+			float bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+			for (auto vv : vs) { if (!f.through) to_screen(vv); bx0 = std::min(bx0, vv.sx); bx1 = std::max(bx1, vv.sx); by0 = std::min(by0, vv.sy); by1 = std::max(by1, vv.sy); }
+			rt_log(LOG_GE, "T   bbox %.0f,%.0f - %.0f,%.0f", bx0, by0, bx1, by1);
+		}
+		rt_log(LOG_GE, "T   texaddr %08x bufw %u swz %u clut %06x cmode %06x", (R[0xa0] & 0xFFFFF0) | ((R[0xa8] & 0x0F0000) << 8), R[0xa8] & 0xFFFF, R[0xc2] & 1, (R[0xb0] & 0xFFFFF0) | ((R[0xb1] & 0x0F0000) << 8), R[0xc5]);
 		rt_log(LOG_GE, "T prim %d n %3d vt %06x thr %d tex %d fmt %u %ux%u zt %d/%d zw %d blend %d at %d cull %d tmap %u px %llu | v0 clip(%.1f %.1f %.1f %.1f) scr(%.0f %.0f %.0f) a %.0f",
 		       type, count, vt, f.through, P.tex, R[0xc3] & 15, P.tw, P.th, P.depthTest, P.zFunc, P.zWrite, P.blend, P.alphaTest, cullOn ? 1 + cullCCW : 0,
 		       R[0xc0] & 3, (unsigned long long)(t_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a);

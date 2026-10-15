@@ -6,7 +6,8 @@ struct Settings {
 	int fps = 30;              // 30 = original pacing, 60 / 120 = raised game rate (time-based engine)
 	int width = 960;           // window size (output resolution)
 	int height = 544;
-	int renderScale = 0;       // internal resolution = 480x272 * scale; 0 = match the window height
+	int renderScale = 0;
+	std::string renderer = "gl";   // gl (GPU) or software       // internal resolution = 480x272 * scale; 0 = match the window height
 	bool fullscreen = false;   // borderless desktop fullscreen
 	bool linear = true;        // scaling filter: linear (smooth) or nearest (sharp pixels)
 	bool vsync = false;        // host vsync on present
