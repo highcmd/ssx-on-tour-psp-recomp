@@ -55,8 +55,7 @@ static inline u32 conv(u32 fmt, u32 p) {
 	return 0xFF000000u | (b << 16) | (g << 8) | r;
 }
 
-void display_present() {
-	if (s_headless || !s_fb_addr) return;
+static void convert_fb() {
 	u32 bpp = s_fb_fmt == 3 ? 4 : 2;
 	const u8 *src = gptr(s_fb_addr);
 	for (int y = 0; y < 272; y++) {
@@ -68,6 +67,34 @@ void display_present() {
 			for (int x = 0; x < 480; x++) { u16 p; memcpy(&p, row + x * 2, 2); dst[x] = conv(s_fb_fmt, p); }
 		}
 	}
+}
+
+static void write_ppm(const char *path) {
+	FILE *f = fopen(path, "wb");
+	if (!f) return;
+	fprintf(f, "P6\n480 272\n255\n");
+	for (int i = 0; i < 480 * 272; i++) {
+		u8 px[3] = {(u8)(s_rgba[i] & 255), (u8)((s_rgba[i] >> 8) & 255), (u8)((s_rgba[i] >> 16) & 255)};
+		fwrite(px, 1, 3, f);
+	}
+	fclose(f);
+}
+
+void display_present() {
+	static double every = getenv("SSX_SHOT_EVERY") ? atof(getenv("SSX_SHOT_EVERY")) : 0;
+	static double next = every;
+	static int shot = 0;
+	if (!s_fb_addr) return;
+	bool wantShot = every > 0 && rt_time_us() / 1e6 >= next;
+	if (s_headless && !wantShot) return;
+	convert_fb();
+	if (wantShot) {
+		char name[64];
+		snprintf(name, sizeof(name), "shot_%03d.ppm", shot++);
+		write_ppm(name);
+		next += every;
+	}
+	if (s_headless) return;
 	SDL_UpdateTexture(s_tex, nullptr, s_rgba, 480 * 4);
 	SDL_RenderClear(s_ren);
 	SDL_RenderCopy(s_ren, s_tex, nullptr, nullptr);
