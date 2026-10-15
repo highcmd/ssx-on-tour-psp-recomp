@@ -285,7 +285,8 @@ HLE(IoFileMgrForUser, sceIoRename) {
 HLE(IoFileMgrForUser, sceIoDevctl) {
 	std::string dev = gstr(ARG(0));
 	u32 cmd = ARG(1), out = ARG(4), outlen = ARG(5);
-	LOGIO("devctl '%s' cmd %08x in %08x/%x out %08x/%x", dev.c_str(), cmd, ARG(2), ARG(3), out, outlen);
+	if (cmd != 0x02025806)  // the game polls "inserted?" every few frames
+		LOGIO("devctl '%s' cmd %08x in %08x/%x out %08x/%x", dev.c_str(), cmd, ARG(2), ARG(3), out, outlen);
 	if (dev.rfind("ms", 0) == 0 || dev.rfind("fatms", 0) == 0 || dev.rfind("mscmhc", 0) == 0) {
 		switch (cmd) {
 		case 0x02425818:  // free space: struct pointer in input
@@ -299,9 +300,12 @@ HLE(IoFileMgrForUser, sceIoDevctl) {
 			}
 			RET(0);
 			return;
-		case 0x02025806:  // inserted?
-		case 0x02025801:
+		case 0x02025806:  // inserted? 1 = yes, 2 = no
 			if (out) SW(out, 1);
+			RET(0);
+			return;
+		case 0x02025801:  // driver state: 4 = stick inserted, 1 = driver ready only
+			if (out) SW(out, 4);
 			RET(0);
 			return;
 		}
