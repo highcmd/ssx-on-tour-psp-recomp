@@ -48,6 +48,7 @@ add_executable(ssx
   runtime/src/hle_mpeg.cpp)
 target_include_directories(ssx PRIVATE runtime/src runtime/vfpu/shim ${GEN_DIR})
 target_compile_options(ssx PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing -fwrapv)
+set_source_files_properties(runtime/src/ge_render.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
 target_compile_definitions(ssx PRIVATE
   SSX_DEFAULT_IMAGE="${GEN_DIR}/image.bin"
   SSX_DEFAULT_UMD="${CMAKE_SOURCE_DIR}/extracted"

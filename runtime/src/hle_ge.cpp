@@ -30,6 +30,7 @@ static std::map<int, DisplayList> s_lists;
 static int s_next_list = 1;
 static u32 s_ge_cmds[256];
 u64 g_ge_list_count, g_ge_cmd_count;
+u32 g_ge_base, g_ge_offset;   // BASE / OFFSETADDR of the list being executed (for VADDR/IADDR)
 
 u32 ge_get_cmd(int i) { return s_ge_cmds[i & 0xFF]; }
 
@@ -52,6 +53,8 @@ static void run_list(DisplayList &l) {
 		l.pc += 4;
 		g_ge_cmd_count++;
 		s_ge_cmds[cmd] = op;
+		g_ge_base = l.base;
+		g_ge_offset = l.offset;
 		switch (cmd) {
 		case 0x08:  // JUMP
 			l.pc = ge_addr(l, op) & ~3u;

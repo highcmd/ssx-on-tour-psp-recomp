@@ -25,6 +25,8 @@ static void usage() {
 static void on_term(int) {
 	rt_log(LOG_RT, "SIGTERM: thread dump");
 	kernel_dump_threads();
+	void ge_dump_stats();
+	ge_dump_stats();
 	_exit(3);
 }
 
