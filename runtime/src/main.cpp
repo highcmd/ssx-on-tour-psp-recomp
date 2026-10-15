@@ -67,6 +67,8 @@ int main(int argc, char **argv) {
 	hle_init_imports();
 	kernel_reserve_image();
 	display_init(headless);
+	void audio_init(bool headless);
+	audio_init(headless);
 	kernel_init();
 	kernel_start_module(g_image_entry);
 	kernel_run();
