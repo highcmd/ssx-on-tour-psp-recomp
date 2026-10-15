@@ -18,6 +18,7 @@ static float morphW[8];
 static u8 clut[1024];
 static u32 s_vaddr, s_iaddr;
 static u64 s_prims, s_pixels;
+static int s_traceState;   // 0 idle, 1 armed (wait FINISH), 2 tracing, 3 done
 extern u32 g_ge_base, g_ge_offset;
 
 static inline float f24(u32 v) { u32 b = v << 8; float f; memcpy(&f, &b, 4); return f; }
@@ -192,6 +193,9 @@ static Vtx transform_vertex(const VFormat &f, const u8 *p) {
 
 	if (f.through) {
 		v.sx = pos[0]; v.sy = pos[1]; v.sz = pos[2];
+		// through mode: z is unsigned (u8/u16), only x/y are signed
+		if (f.pos == 2) { u16 z; memcpy(&z, p + f.oP + 4, 2); v.sz = z; }
+		else if (f.pos == 1) v.sz = p[f.oP + 2];
 		v.w = 1;
 		v.u = tc[0]; v.v = tc[1];
 		v.r = col[0]; v.g = col[1]; v.b = col[2]; v.a = col[3];
@@ -769,6 +773,9 @@ static void draw_prim(u32 op) {
 	if (idxSize) s_iaddr += count * idxSize;
 	else s_vaddr += count * f.size * f.nm;
 
+	static double traceAt = getenv("SSX_GETRACE_AT") ? atof(getenv("SSX_GETRACE_AT")) : -1;
+	if (traceAt >= 0 && s_traceState == 0 && rt_time_us() / 1e6 >= traceAt) s_traceState = 1;
+	u64 px0 = s_pixels;
 	static int dbg = getenv("SSX_GEDEBUG") ? atoi(getenv("SSX_GEDEBUG")) : 0;
 	if (dbg > 0) {
 		dbg--;
@@ -809,6 +816,15 @@ static void draw_prim(u32 op) {
 			draw_sprite(a, b);
 		}
 		break;
+	}
+	if (s_traceState == 2) {
+		Vtx a = vs[0];
+		if (!f.through) to_screen(a);
+		if (P.clear || type == 4) rt_log(LOG_GE, "T   viewport z: scale %f pos %f  minz %u maxz %u  zbuf %p clearDepth %d v0.sz %.1f",
+		       f24(R[0x44]), f24(R[0x47]), R[0xd6] & 0xFFFF, R[0xd7] & 0xFFFF, (void *)P.tgt.zb, P.clearDepth, a.sz);
+		rt_log(LOG_GE, "T prim %d n %3d vt %06x thr %d tex %d fmt %u %ux%u zt %d/%d zw %d blend %d at %d cull %d tmap %u px %llu | v0 clip(%.1f %.1f %.1f %.1f) scr(%.0f %.0f %.0f) a %.0f",
+		       type, count, vt, f.through, P.tex, R[0xc3] & 15, P.tw, P.th, P.depthTest, P.zFunc, P.zWrite, P.blend, P.alphaTest, cullOn ? 1 + cullCCW : 0,
+		       R[0xc0] & 3, (unsigned long long)(s_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a);
 	}
 }
 
@@ -855,6 +871,10 @@ void ge_exec_cmd(u32 cmd, u32 op, u32 pc) {
 	}
 	case 0xc5: s_clut_hash ^= 0x9E3779B97F4A7C15ull * (data + 1); break;
 	case 0xea: block_transfer(); break;
+	case 0x0f:  // FINISH: frame boundary for tracing
+		if (s_traceState == 1) { s_traceState = 2; rt_log(LOG_GE, "T ---- frame trace start"); }
+		else if (s_traceState == 2) { s_traceState = 3; rt_log(LOG_GE, "T ---- frame trace end"); }
+		break;
 	default: break;
 	}
 }
