@@ -30,6 +30,9 @@ static void on_term(int) {
 	kernel_dump_threads();
 	void ge_dump_stats();
 	ge_dump_stats();
+	extern u64 g_hle_calls[256];
+	for (size_t i = 0; i < g_import_count && i < 256; i++)
+		if (g_hle_calls[i] > 20000) rt_log(LOG_RT, "  HLE %s: %llu calls", g_import_list[i].name, (unsigned long long)g_hle_calls[i]);
 	_exit(3);
 }
 

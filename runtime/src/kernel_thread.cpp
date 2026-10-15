@@ -181,7 +181,7 @@ u32 kernel_wait(WaitType type, u32 id, u64 timeout_us, bool allowCallbacks, u32 
 	t->waitCB = false;
 	static double traceAt = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
 	u64 now = rt_time_us();
-	if (traceAt >= 0 && now / 1e6 >= traceAt && now - waitStart > 8000 && type != WAIT_VBLANK && type != WAIT_DELAY)
+	if (traceAt >= 0 && now / 1e6 >= traceAt && ((now - waitStart > 8000 && type != WAIT_VBLANK && type != WAIT_DELAY) || (t->id == 257 && now - waitStart > 500)))
 		rt_log(LOG_THREAD, "long wait: '%s' type %d id %x %.1f ms ra=%08x", t->name.c_str(), type, id, (now - waitStart) / 1e3, t->ctx.r[31]);
 	return t->waitResult;
 }

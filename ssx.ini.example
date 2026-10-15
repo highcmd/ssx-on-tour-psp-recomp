@@ -1,0 +1,8 @@
+# Copy to ssx.ini (in the directory you start ssx from). Command-line flags override these.
+fps = 60               # 30 (original), 60 or 120
+resolution = 1440x816  # window size; the PSP picture keeps its 480:272 aspect ratio
+fullscreen = false     # F11 toggles at run time
+filter = linear        # linear (smooth) or nearest (sharp pixels)
+vsync = false
+deadzone = 8000        # gamepad left-stick deadzone, 0..32767
+right_stick_dpad = false

@@ -4,6 +4,7 @@
 // the scheduler as interrupts (kernel_post_interrupt). DrawSync/ListSync really
 // wait. Control-flow commands are handled here; everything else goes to
 // ge_exec_cmd() (the renderer, which only ever runs on the GE thread).
+#include <algorithm>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -34,6 +35,7 @@ struct DisplayList {
 	u32 offset;    // OFFSETADDR
 	u32 stack[32];
 	int sp;
+	u64 startedAt;
 };
 
 // Shared between the CPU (scheduler) side and the GE thread.
@@ -44,6 +46,7 @@ static int s_next_list = 1;
 static bool s_busy;                      // GE thread is executing commands
 static u32 s_ge_cmds[256];
 u64 g_ge_list_count, g_ge_cmd_count;
+u64 g_ge_list_us, g_ge_list_max_us;
 u32 g_ge_base, g_ge_offset;   // BASE / OFFSETADDR of the list being executed (for VADDR/IADDR)
 
 u32 ge_get_cmd(int i) { return s_ge_cmds[i & 0xFF]; }
@@ -143,9 +146,16 @@ static void ge_thread_main() {
 		});
 		s_busy = true;
 		DisplayList &l = s_queue.front();
+		if (!l.startedAt) l.startedAt = rt_time_us();
 		bool done = run_list(l, lk);   // lock held on return
 		int id = l.id;
-		if (done) s_queue.pop_front();
+		if (done) {
+			extern u64 g_ge_list_us, g_ge_list_max_us;
+			u64 d = rt_time_us() - l.startedAt;
+			g_ge_list_us += d;
+			g_ge_list_max_us = std::max(g_ge_list_max_us, d);
+			s_queue.pop_front();
+		}
 		else { lk.unlock(); ge_submit(); lk.lock(); }   // stalled: keep the workers busy meanwhile
 		s_busy = false;
 		lk.unlock();

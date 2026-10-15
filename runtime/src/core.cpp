@@ -2,6 +2,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <array>
+#include <atomic>
+#include <thread>
+#include <pthread.h>
 #include <chrono>
 #include <utility>
 #include <cstdlib>
@@ -59,12 +62,28 @@ void rt_log_error(const char *fmt, ...) {
 	va_end(ap);
 }
 
-// Microseconds since start. Note: on this machine the TSC is not synchronised
-// across cores (the kernel uses HPET), so rdtsc cannot be used as a clock.
-u64 rt_time_us() {
+// Microseconds since start. On this machine the kernel clocksource is HPET
+// (the TSC is not synchronised across cores), which makes every clock_gettime
+// a syscall. A ticker thread publishes the time every ~100 us instead, so
+// rt_time_us() is a plain atomic load (resolution 0.1 ms).
+static u64 steady_us() {
 	static auto t0 = std::chrono::steady_clock::now();
 	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
+static std::atomic<u64> s_now_us;
+static struct Ticker {
+	Ticker() {
+		steady_us();
+		std::thread([] {
+			pthread_setname_np(pthread_self(), "ticker");
+			while (true) {
+				s_now_us.store(steady_us(), std::memory_order_relaxed);
+				std::this_thread::sleep_for(std::chrono::microseconds(100));
+			}
+		}).detach();
+	}
+} s_ticker;
+u64 rt_time_us() { return std::max<u64>(s_now_us.load(std::memory_order_relaxed), 1); }
 
 std::string gstr(u32 a) {
 	if (!a || !gvalid(a)) return "(null)";
@@ -188,8 +207,10 @@ static constexpr std::array<HLEFunc, sizeof...(Is)> make_tramps(std::integer_seq
 // to run right after it (see kernel_poll_interrupts).
 void kernel_poll_interrupts();
 static HLEFunc s_real[256];
+u64 g_hle_calls[256];
 template <int N>
 static void hle_wrap(CPUState *c) {
+	g_hle_calls[N]++;
 	s_real[N](c);
 	kernel_poll_interrupts();
 }
