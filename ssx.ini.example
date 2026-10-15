@@ -1,6 +1,7 @@
 # Copy to ssx.ini (in the directory you start ssx from). Command-line flags override these.
 fps = 60               # 30 (original), 60 or 120
 resolution = 1440x816  # window size; the PSP picture keeps its 480:272 aspect ratio
+renderer = gl          # gl (GPU, default) or software (CPU reference)
 render_scale = 0       # internal resolution 480x272 x N; 0 = match the window height (816 -> 3)
 fullscreen = false     # F11 toggles at run time
 filter = linear        # linear (smooth) or nearest (sharp pixels)

@@ -76,6 +76,20 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
   ~45 ns/px software shading is the limit -> needs SIMD spans or a GPU backend for high S.
 - Bezier patches (cmd 0x05) draw the snow terrain; control points are skinned (vtype 0x780).
 
+## GPU renderer (default, --renderer gl)
+- CPU side unchanged (decode, skinning, Bezier, lighting, fog, near clip); ge_gl.cpp rasterises:
+  one FBO per PSP colour target address (RGBA8, 512*S square) + D24S8 per Z address.
+- Shader: texture functions, colour doubling, fog, alpha test, Z range; PSP blend factors mapped to GL
+  (doubled src alpha / distinct FIX colours folded into a shader pre-multiply).
+- PSP stencil == framebuffer alpha: alpha writes are mirrored into GL stencil with
+  GL_ARB_shader_stencil_export (1-bit for 5551, 4-bit for 4444); STE uses real GL stencil ops.
+- Contexts: GE thread (hidden 1x1 window, SDL on X11 has no surfaceless) and a present thread on the
+  game window; GL fences at FINISH. Render-to-texture samples the FBO texture when the texture
+  address equals a target (not used in races; VRAM textures there are real uploads).
+- No VRAM writeback of GPU-rendered pixels (avoids the display-list corruption seen with shadows).
+- Races at 1920x1088 (S=4): 30/60/120 fps all hold; S=6 holds 60.
+- PSP DXT3/DXT5 store the colour block first, then alpha (fixed in both renderers).
+
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never
 committed (see .gitignore).
