@@ -46,6 +46,7 @@ void display_init(bool headless) {
 		s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
 		return;
 	}
+	SDL_SetMainReady();   // our main() is not SDL_main
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   // our own SIGINT handler quits at once
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
 		rt_log_error("SDL_Init: %s", SDL_GetError());

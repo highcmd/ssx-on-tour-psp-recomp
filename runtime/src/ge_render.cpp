@@ -15,7 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <pthread.h>
+#include "platform.h"
 #include <unordered_map>
 #include <vector>
 
@@ -1180,7 +1180,7 @@ static void run_jobs(int tid) {
 static void worker_main(int tid) {
 	char nm[16];
 	snprintf(nm, sizeof(nm), "raster%d", tid);
-	pthread_setname_np(pthread_self(), nm);
+	platform_set_thread_name(nm);
 	u64 seen = 0;
 	while (true) {
 		{

@@ -43,6 +43,7 @@ static bool apply_setting(const std::string &k, const std::string &v) {
 	else if (k == "deadzone") s.deadzone = std::max(0, std::min(32767, atoi(v.c_str())));
 	else if (k == "right_stick_dpad") s.rightStickAsDpad = parse_bool(v);
 	else if (k == "pad_mapping") s.padMapping = v;
+	else if (k == "iso") s.isoPath = v;
 	else return false;
 	return true;
 }
@@ -98,5 +99,5 @@ const char *settings_usage() {
 	       "  --deadzone N             gamepad stick deadzone 0..32767 (default 8000); --right-stick-dpad\n"
 	       "  --pad-mapping STR        extra SDL GameControllerDB mapping line for an unknown pad\n"
 	       "  every setting can also go in ./ssx.ini as key = value (fps, resolution, scale, renderer, render_scale,\n"
-	       "  fullscreen, filter, vsync, deadzone, right_stick_dpad, pad_mapping); flags override the file. See docs/OPTIONS.md\n";
+	       "  fullscreen, filter, vsync, deadzone, right_stick_dpad, pad_mapping, iso); flags override the file. See docs/OPTIONS.md\n";
 }

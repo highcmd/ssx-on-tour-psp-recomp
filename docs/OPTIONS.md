@@ -2,8 +2,9 @@
 
 You can set options in two places:
 
-1. **`run/ssx.ini`**: the configuration file, read from the directory the game starts in. `run.sh`
-   always starts it in `run/`. Copy [`ssx.ini.example`](../ssx.ini.example) there to begin.
+1. **`ssx.ini`**: the configuration file. On Linux it is read from the directory the game starts
+   in; `run.sh` always starts it in `run/`, so the file is `run/ssx.ini`. On Windows it is read
+   from the folder of `ssx.exe`. Copy [`ssx.ini.example`](../ssx.ini.example) to begin.
 2. **Command-line flags**: `./run.sh --fps 60 --fullscreen`. A flag overrides the same key in the file.
 
 In `ssx.ini`, write `key = value`, one per line; `#` starts a comment. On the command line, use
@@ -25,6 +26,7 @@ In `ssx.ini`, write `key = value`, one per line; `#` starts a comment. On the co
 | `deadzone` | `--deadzone N` | `0`–`32767` | `8000` | left-stick deadzone; raise it if the rider drifts |
 | `right_stick_dpad` | `--right-stick-dpad` | `true`/`false` | `false` | the right stick also works as the D-pad (menus) |
 | `pad_mapping` | `--pad-mapping STR` | SDL mapping line | none | adds a mapping for a pad SDL doesn't know, see [Gamepads](#gamepads) |
+| `iso` | `--iso FILE` | path | see [Paths](#paths) | your UMD image |
 
 In `ssx.ini`, booleans accept `true`/`1`/`on`/`yes`; anything else counts as false.
 
@@ -107,23 +109,28 @@ SDL also reads the `SDL_GAMECONTROLLERCONFIG` environment variable, which holds 
 
 ## Paths
 
-`ssx` (and therefore `run.sh`) also accepts these flags. You only need them if you moved the
-files after building:
+The game reads all its files straight from your ISO. It finds the ISO in this order:
 
-| Flag | Default (set at build time) | Contents |
+1. `--iso FILE` on the command line, or `iso = FILE` in `ssx.ini`
+2. on Linux, the image given to `setup.sh` (its path is built into the executable)
+3. the first `*.iso` next to the executable, then in the working directory
+
+Other paths, which you rarely need:
+
+| Flag | Default | Contents |
 |---|---|---|
-| `--umd DIR` | `<repo>/extracted` | extracted UMD file system (`disc0:`) |
-| `--iso FILE` | the ISO given to `setup.sh` | raw image, used for raw `umd0:` sector reads |
-| `--image FILE` | `<repo>/build/gen/image.bin` | initial memory image of the recompiled game |
-| `--assets DIR` | `<repo>/runtime/assets` | runtime data (VFPU tables) |
-| `--ms DIR` | `ms0` (in the working directory, so `run/ms0`) | the memory stick (`ms0:`) |
+| `--image FILE` | Linux: `<repo>/build/gen/image.bin`; Windows: next to `ssx.exe` | initial memory image of the recompiled game |
+| `--assets DIR` | Linux: `<repo>/runtime/assets`; Windows: `assets\` next to `ssx.exe` | runtime data (VFPU tables) |
+| `--ms DIR` | `ms0` in the working directory (`run/ms0`, or next to `ssx.exe` on Windows) | the memory stick (`ms0:`) |
+| `--umd DIR` | none | read the game files from an extracted UMD (`setup.sh --extract-all`) instead of the ISO |
 
 ### Saves
 
-Saves are stored on the virtual memory stick, in the same layout as on a PSP:
+Saves are stored on the virtual memory stick, in the same layout as on a PSP (Linux: `run/ms0`,
+Windows: `ms0\` next to `ssx.exe`):
 
 ```
-run/ms0/PSP/SAVEDATA/ULUS10042001/
+ms0/PSP/SAVEDATA/ULUS10042001/
     DATA.BIN  PARAM.SFO  ICON0.PNG  ICON1.PMF
 ```
 
@@ -132,7 +139,7 @@ copied to a real PSP or to PPSSPP, and saves from those can't be loaded either.
 
 ## Files written at run time
 
-| File (in `run/`) | Contents |
+| File (in `run/`, or next to `ssx.exe` on Windows) | Contents |
 |---|---|
 | `ssx.log` | runtime log; it is overwritten on every start, so keep a copy when reporting a bug |
 | `ms0/` | memory stick (saves) |

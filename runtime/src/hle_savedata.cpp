@@ -4,15 +4,18 @@
 // way the dialog's initial focus would, and the operation completes at once.
 // Structure layout and result codes follow PPSSPP Core/Dialog/SavedataParam
 // (public, GPL). Data is stored unencrypted (not interchangeable with a PSP yet).
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <chrono>
+#include <filesystem>
+#include <system_error>
 #include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "kernel.h"
+#include "platform.h"
+
+namespace fs = std::filesystem;
 
 extern std::string g_ms_root;
 
@@ -58,18 +61,30 @@ void put_str(u32 addr, const std::string &s, size_t n) {
 std::string save_root() { return g_ms_root + "/PSP/SAVEDATA/"; }
 
 bool is_dir(const std::string &p) {
-	struct stat st;
-	return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+	std::error_code ec;
+	return fs::is_directory(u8p(p), ec);
 }
 
 time_t mtime_of(const std::string &p) {
-	struct stat st;
-	return stat(p.c_str(), &st) == 0 ? st.st_mtime : 0;
+	std::error_code ec;
+	auto ft = fs::last_write_time(u8p(p), ec);
+	if (ec) return 0;
+	return std::chrono::system_clock::to_time_t(std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+	    ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
 }
 
 void mkdirs(const std::string &path) {
-	for (size_t i = 1; i <= path.size(); i++)
-		if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755);
+	std::error_code ec;
+	fs::create_directories(u8p(path), ec);
+}
+
+// Names of the entries in a directory (empty if it doesn't exist).
+static std::vector<std::string> list_dir(const std::string &dir) {
+	std::vector<std::string> out;
+	std::error_code ec;
+	for (fs::directory_iterator it(u8p(dir), ec), e; !ec && it != e; it.increment(ec))
+		out.push_back(u8s(it->path().filename()));
+	return out;
 }
 
 bool read_file(const std::string &path, std::vector<u8> &out) {
@@ -90,7 +105,9 @@ bool write_file(const std::string &path, const void *data, size_t n) {
 	if (!f) return false;
 	bool ok = n == 0 || fwrite(data, 1, n, f) == n;
 	ok = fclose(f) == 0 && ok;
-	return ok && rename(tmp.c_str(), path.c_str()) == 0;   // never leave a half-written save
+	std::error_code ec;
+	if (ok) fs::rename(u8p(tmp), u8p(path), ec);   // replaces: never leave a half-written save
+	return ok && !ec;
 }
 
 // ---------------------------------------------------------------- PARAM.SFO
@@ -321,26 +338,19 @@ u32 do_load(u32 p, const std::string &saveName, bool rw) {
 bool do_delete(u32 p, const std::string &saveName) {
 	std::string dir = dir_for(p, saveName);
 	if (saveName.empty() || !is_dir(dir)) return false;
-	if (DIR *d = opendir(dir.c_str())) {
-		while (dirent *e = readdir(d))
-			if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) unlink((dir + "/" + e->d_name).c_str());
-		closedir(d);
-	}
-	return rmdir(dir.c_str()) == 0;
+	std::error_code ec;
+	fs::remove_all(u8p(dir), ec);
+	return !ec;
 }
 
 u32 dir_size(const std::string &dir, u32 cluster, u32 *clusters) {
 	u32 total = 0;
-	if (DIR *d = opendir(dir.c_str())) {
-		while (dirent *e = readdir(d)) {
-			if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-			struct stat st;
-			if (stat((dir + "/" + e->d_name).c_str(), &st) == 0) {
-				total += (u32)st.st_size;
-				*clusters += ((u32)st.st_size + cluster - 1) / cluster;
-			}
-		}
-		closedir(d);
+	for (const std::string &n : list_dir(dir)) {
+		std::error_code ec;
+		u64 sz = fs::file_size(u8p(dir + "/" + n), ec);
+		if (ec) continue;
+		total += (u32)sz;
+		*clusters += ((u32)sz + cluster - 1) / cluster;
 	}
 	return total;
 }
@@ -404,11 +414,10 @@ void do_list(u32 p) {
 		if (star == std::string::npos) return pat == s;
 		return s.compare(0, star, pat, 0, star) == 0;
 	};
-	if (DIR *d = opendir(save_root().c_str())) {
-		while (dirent *e = readdir(d)) {
+	{
+		for (const std::string &n : list_dir(save_root())) {
 			if (count >= maxCount || !gvalid(entries)) break;
-			std::string n = e->d_name;
-			if (n == "." || n == ".." || !match(pattern, n)) continue;
+			if (!match(pattern, n)) continue;
 			u32 ent = entries + count * 72;   // mode, 3 x ScePspDateTime (16), name[20]
 			memset(gptr(ent), 0, 72);
 			SW(ent, 0x11FF);
@@ -416,7 +425,6 @@ void do_list(u32 p) {
 			put_str(ent + 52, n.size() > game.size() ? n.substr(game.size()) : std::string(), 20);
 			count++;
 		}
-		closedir(d);
 	}
 	SW(idList + 4, count);
 }

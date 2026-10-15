@@ -12,7 +12,9 @@ with a custom runtime (HLE kernel, GE→OpenGL, audio via SDL).
 - User has a real PSP with CFW (model/firmware: not yet asked).
 
 ## Input
-- `tools/setup_from_iso.py` (via `./setup.sh <dump>`): zip → `iso/`, ISO 9660 → `extracted/`, verifies ULUS-10042 + BOOT.BIN SHA-1.
+- `tools/setup_from_iso.py` (via `./setup.sh <dump>` / `setup.bat`): zip → `iso/`, verifies ULUS-10042 + BOOT.BIN SHA-1,
+  extracts only BOOT.BIN (+UMD_DATA.BIN, PARAM.SFO) to `extracted/`. The runtime reads disc0: from the ISO
+  (ISO 9660 index in hle_io.cpp; the game itself mostly reads raw `umd0:` sectors).
 - `extracted/PSP_GAME/SYSDIR/BOOT.BIN`: **unencrypted** ELF PRX (type 0xFFA0), module `ssxpsp` v1.1.
   EBOOT.BIN is the same program encrypted (~PSP) — ignore it.
 - No symbol table, but section names, full relocations, RTTI class names and source paths survive.
@@ -99,6 +101,15 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
   after START. List modes pick the slot the system dialog would focus (no UI drawn).
 - Data is stored unencrypted, so saves are not yet interchangeable with a real PSP. Doing that needs
   the PSP savedata crypto (sceChnnlsv + KIRK, mode 1 for key-less games) and the SFO hashes, as PPSSPP has.
+
+## Windows port (2026-10-15)
+- `runtime/src/platform.{h,cpp}`: guest memory (mmap / VirtualAlloc), fibers (ucontext / Win32 fibers with
+  FIBER_FLAG_FLOAT_SWITCH; a restarted thread gets a fresh fiber), thread names, exe dir, localtime.
+  Directories via std::filesystem with UTF-8 paths (`u8p`/`u8s`; the exe manifest sets the UTF-8 code page).
+- Windows: rt_time_us() reads QPC directly (no ticker thread: Sleep is too coarse); timeBeginPeriod(1).
+- Build: llvm-mingw 20260922 (UCRT) + SDL2 2.32.10 mingw + BtbN FFmpeg n8.1 shared (`tools/win_deps.py`,
+  `cmake/llvm-mingw.cmake`); `SSX_PORTABLE`: image.bin/assets next to the exe, which is also the cwd.
+  `setup --target windows` assembles `dist/ssx-windows-x64`. Verified under Wine 11 (boot → race, saves, pad).
 
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never

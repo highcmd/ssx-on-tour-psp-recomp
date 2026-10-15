@@ -6,16 +6,17 @@ the UMD image you dumped yourself (.iso, or a .zip holding one) and produces
 everything locally:
 
   iso/<name>.iso         the image (unpacked from the zip, or a symlink to it)
-  extracted/             the UMD file system (read by the runtime as disc0:)
+  extracted/             BOOT.BIN and a few headers for the recompiler (--extract-all: everything)
   data/functions.json    function analysis of BOOT.BIN
   build/gen/             recompiled C++ and the memory image
-  build/cmake/ssx        the executable
+  build/cmake/ssx        the executable (Linux)
+  dist/ssx-windows-x64/  ssx.exe with its DLLs and data (--target windows)
 
 All of these are in .gitignore. Usage:
 
-  tools/setup_from_iso.py <image.iso|image.zip> [--no-build] [--force] [-j N]
+  tools/setup_from_iso.py <image.iso|image.zip> [--target linux|windows] [--no-build] [--force] [-j N]
 """
-import argparse, hashlib, os, pathlib, shutil, struct, subprocess, sys, zipfile
+import argparse, glob, hashlib, os, pathlib, platform, shutil, struct, subprocess, sys, zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SECTOR = 2048
@@ -141,8 +142,11 @@ def obtain_iso(src):
     if link.is_symlink() or link.exists():
         if link.resolve() != src:
             die(f"{link} already exists and points elsewhere; remove it first")
-    else:
+        return link
+    try:
         link.symlink_to(src)
+    except OSError:   # Windows without the symlink privilege: use the file where it is
+        return src
     return link
 
 
@@ -163,13 +167,17 @@ def verify(iso):
     print(f"    {GAME_ID.decode()}, BOOT.BIN {sha[:12]}… OK")
 
 
-def extract(iso, force):
+# The runtime reads the game straight from the ISO; the recompiler only needs these.
+NEEDED = ["UMD_DATA.BIN", "PSP_GAME/PARAM.SFO", "PSP_GAME/SYSDIR/BOOT.BIN"]
+
+
+def extract(iso, force, everything):
     out = ROOT / "extracted"
-    stamp = out / ".complete"
+    stamp = out / (".complete" if everything else ".boot")
     if stamp.exists() and not force:
         step("extracted/ is up to date")
         return
-    step("extracting the UMD file system to extracted/")
+    step("extracting " + ("the UMD file system" if everything else "BOOT.BIN") + " to extracted/")
     if out.exists():
         shutil.rmtree(out)
     tmp = ROOT / "extracted.part"
@@ -177,7 +185,10 @@ def extract(iso, force):
         shutil.rmtree(tmp)
     tmp.mkdir()
     n = total = 0
+    wanted = None if everything else {p.upper() for p in NEEDED}
     for path, rec in iso.walk():
+        if wanted is not None and path.upper() not in wanted:
+            continue
         dst = tmp / path
         if rec["dir"]:
             dst.mkdir(parents=True, exist_ok=True)
@@ -186,7 +197,7 @@ def extract(iso, force):
         iso.copy_to(rec, dst)
         n += 1
         total += rec["size"]
-    (tmp / ".complete").write_text(BOOT_SHA1 + "\n")
+    (tmp / stamp.name).write_text(BOOT_SHA1 + "\n")
     tmp.rename(out)
     print(f"    {n} files, {total >> 20} MiB")
 
@@ -215,34 +226,112 @@ def recompile(force):
     run([py, ROOT / "tools/recomp.py"])
 
 
+def tool(name):
+    """Find a build tool on PATH or next to this Python (pip-installed cmake/ninja)."""
+    here = pathlib.Path(sys.executable).parent
+    found = shutil.which(name) or shutil.which(name, path=str(here))
+    if not found:
+        die(f"'{name}' not found; see docs/BUILDING.md for the build dependencies")
+    return found
+
+
 def build(iso_path, jobs):
-    for tool in ("cmake", "ninja", "clang++"):
-        if not shutil.which(tool):
-            die(f"'{tool}' not found; see README.md for the build dependencies")
+    if not shutil.which("clang++"):
+        die("'clang++' not found; see docs/BUILDING.md for the build dependencies")
     step("configuring and building")
     bdir = ROOT / "build/cmake"
-    run(["cmake", "-S", ROOT, "-B", bdir, "-G", "Ninja",
+    run([tool("cmake"), "-S", ROOT, "-B", bdir, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}",
          "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER=clang++",
          f"-DSSX_ISO={iso_path.resolve()}"])
-    run(["ninja", "-C", bdir, "ssx"] + (["-j", str(jobs)] if jobs else []))
+    run([tool("ninja"), "-C", bdir, "ssx"] + (["-j", str(jobs)] if jobs else []))
+    step("done. Start the game with ./run.sh (options: ./run.sh --help)")
+
+
+WINDOWS_README = """SSX On Tour - native Windows build (static recompilation)
+==========================================================
+
+1. Put your SSX On Tour (USA, ULUS-10042) .iso in this folder, next to ssx.exe,
+   or write its location into ssx.ini:   iso = D:\\Games\\SSX On Tour.iso
+2. Start ssx.exe.
+
+Settings: copy ssx.ini.example to ssx.ini and edit it (frame rate, resolution,
+fullscreen, ...). The full list is in docs/OPTIONS.md of the source repository.
+Saves are written to ms0\\PSP\\SAVEDATA\\ here; the log goes to ssx.log.
+
+This folder was generated from your own copy of the game (image.bin is derived
+from it). Do not share it. ssx.exe is GPL-2.0-or-later (LICENSE.txt); SDL2 is
+zlib-licensed and FFmpeg is GPL (see licenses\\).
+"""
+
+
+def build_windows(iso_path, jobs):
+    import win_deps
+    deps = win_deps.ensure()
+    step("configuring and building for Windows x64")
+    bdir = ROOT / "build/win64"
+    run([tool("cmake"), "-S", ROOT, "-B", bdir, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}",
+         "-DCMAKE_BUILD_TYPE=Release",
+         f"-DCMAKE_TOOLCHAIN_FILE={ROOT / 'cmake/llvm-mingw.cmake'}",
+         f"-DLLVM_MINGW={deps['llvm']}",
+         f"-DCMAKE_PREFIX_PATH={deps['sdl2']}",
+         f"-DSSX_FFMPEG_ROOT={deps['ffmpeg']}",
+         "-DSSX_NATIVE_ARCH=OFF"])
+    run([tool("ninja"), "-C", bdir, "ssx"] + (["-j", str(jobs)] if jobs else []))
+
+    step("assembling dist/ssx-windows-x64")
+    dist = ROOT / "dist/ssx-windows-x64"
+    dist.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bdir / "ssx.exe", dist)
+    shutil.copy2(deps["sdl2"] / "bin/SDL2.dll", dist)
+    for prefix in ("avcodec-", "avutil-", "swscale-", "swresample-"):
+        for dll in glob.glob(str(deps["ffmpeg"] / "bin" / f"{prefix}*.dll")):
+            shutil.copy2(dll, dist)
+    shutil.copy2(ROOT / "build/gen/image.bin", dist)
+    shutil.copytree(ROOT / "runtime/assets", dist / "assets", dirs_exist_ok=True)
+    shutil.copy2(ROOT / "ssx.ini.example", dist)
+    shutil.copy2(ROOT / "LICENSE", dist / "LICENSE.txt")
+    lic = dist / "licenses"
+    lic.mkdir(exist_ok=True)
+    shutil.copy2(deps["ffmpeg"] / "LICENSE.txt", lic / "FFmpeg-LICENSE.txt")
+    sdl_lic = deps["sdl2"].parent / "LICENSE.txt"
+    if sdl_lic.exists():
+        shutil.copy2(sdl_lic, lic / "SDL2-LICENSE.txt")
+    (dist / "README.txt").write_bytes(WINDOWS_README.replace("\n", "\r\n").encode())
+    ini = dist / "ssx.ini"
+    if platform.system() == "Windows" and not ini.exists():
+        ini.write_text(f"iso = {iso_path.resolve()}\n")
+        where = "ssx.ini points at your ISO"
+    elif any(dist.glob("*.iso")) or (ini.exists() and "iso" in ini.read_text()):
+        where = "the ISO is already set up"
+    else:
+        where = f"copy your ISO ({iso_path.name}) into that folder, or set 'iso = <path>' in ssx.ini there"
+    step(f"done: {dist}\n    {where}, then start ssx.exe")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("image", type=pathlib.Path, help="your SSX On Tour USA dump (.iso or .zip)")
+    ap.add_argument("--target", choices=["linux", "windows"],
+                    default="windows" if platform.system() == "Windows" else "linux",
+                    help="what to build (default: this system); windows works from Linux/WSL too")
     ap.add_argument("--no-build", action="store_true", help="stop after generating build/gen")
     ap.add_argument("--force", action="store_true", help="redo extraction and analysis")
+    ap.add_argument("--extract-all", action="store_true",
+                    help="extract the whole UMD (only needed to run with --umd <dir> instead of the ISO)")
     ap.add_argument("-j", "--jobs", type=int, default=0, help="parallel compile jobs")
     a = ap.parse_args()
 
     iso_path = obtain_iso(a.image)
     iso = Iso(iso_path)
     verify(iso)
-    extract(iso, a.force)
+    extract(iso, a.force, a.extract_all)
     recompile(a.force)
-    if not a.no_build:
+    if a.no_build:
+        return
+    if a.target == "windows":
+        build_windows(iso_path, a.jobs)
+    else:
         build(iso_path, a.jobs)
-    step("done. Start the game with ./run.sh (options: ./run.sh --help)")
 
 
 if __name__ == "__main__":

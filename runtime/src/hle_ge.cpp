@@ -11,7 +11,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
-#include <pthread.h>
+#include "platform.h"
 #include <vector>
 
 #include "kernel.h"
@@ -150,7 +150,7 @@ static bool run_list(DisplayList &l, std::unique_lock<std::mutex> &lk) {
 }
 
 static void ge_thread_main() {
-	pthread_setname_np(pthread_self(), "ge");
+	platform_set_thread_name("ge");
 	std::unique_lock<std::mutex> lk(s_mtx);
 	while (true) {
 		s_cv.wait(lk, [] {

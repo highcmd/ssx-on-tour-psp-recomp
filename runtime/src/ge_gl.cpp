@@ -11,7 +11,7 @@
 // so scissor rects and texture rows need no flipping; only presentation flips.
 #include "ge_gl.h"
 
-#include <pthread.h>
+#include "platform.h"
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -578,7 +578,7 @@ void write_ppm(const std::string &path, const std::vector<u32> &px, int w, int h
 }
 
 void present_thread() {
-	pthread_setname_np(pthread_self(), "present");
+	platform_set_thread_name("present");
 	if (SDL_GL_MakeCurrent(g_win, g_presentCtx) != 0) {
 		rt_log_error("GL: present MakeCurrent failed: %s", SDL_GetError());
 		return;

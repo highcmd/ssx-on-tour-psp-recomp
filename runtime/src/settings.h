@@ -14,6 +14,7 @@ struct Settings {
 	int deadzone = 8000;       // gamepad stick deadzone (0..32767)
 	bool rightStickAsDpad = false;
 	std::string padMapping;    // optional SDL_GameControllerDB line
+	std::string isoPath;       // UMD image (ssx.ini 'iso'; --iso on the command line)
 };
 
 extern Settings g_settings;
