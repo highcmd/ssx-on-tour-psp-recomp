@@ -19,7 +19,7 @@ extern std::string g_umd_root, g_ms_root, g_assetDir, g_iso_path;
 
 static void usage() {
 	fprintf(stderr,
-	        "usage: ssx [--umd <extracted UMD dir>] [--image <image.bin>] [--iso <umd.iso>] [--assets <dir>] [--headless]\n%s"
+	        "usage: ssx [--umd <extracted UMD dir>] [--image <image.bin>] [--iso <umd.iso>] [--assets <dir>] [--ms <memory stick dir>] [--headless]\n%s"
 	        "  keys: arrows=d-pad, Z=cross X=circle A=square S=triangle Q/E=L/R Enter=start Backspace=select IJKL=analog, F11=fullscreen\n"
 	        "  gamepad (Xbox layout): A=cross B=circle X=square Y=triangle, LB/LT=L, RB/RT=R, Start, Back=select, left stick/d-pad\n",
 	        settings_usage());

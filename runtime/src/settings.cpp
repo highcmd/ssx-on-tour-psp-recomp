@@ -91,9 +91,12 @@ int settings_render_scale() {
 
 const char *settings_usage() {
 	return "  --renderer gl|software  GPU (OpenGL 3.3, default) or the CPU reference renderer\n"
-	       "  --render-scale N         internal resolution 480x272 x N (default: match the window height, e.g. 1088 -> 4)\n"
-	       "  --fps 30|60|120          game rate (30 = original; 60/120 raise the engine's tick, see NOTES.md)\n"
-	       "  --res WxH | --scale N    window size (default 960x544); --fullscreen; --filter linear|nearest; --vsync\n"
+	       "  --render-scale N         internal resolution 480x272 x N, 1..6 (0/default: match the window height, e.g. 1088 -> 4)\n"
+	       "  --fps 30|60|120          game rate (30 = original; 60/120 raise the engine's tick)\n"
+	       "  --res WxH | --scale N    window size (default 960x544); --fullscreen / --windowed\n"
+	       "  --filter linear|nearest  scaling filter for the final picture; --vsync\n"
 	       "  --deadzone N             gamepad stick deadzone 0..32767 (default 8000); --right-stick-dpad\n"
-	       "  settings may also be put in ssx.ini as key = value (fps, resolution, fullscreen, filter, vsync, deadzone)\n";
+	       "  --pad-mapping STR        extra SDL GameControllerDB mapping line for an unknown pad\n"
+	       "  every setting can also go in ./ssx.ini as key = value (fps, resolution, scale, renderer, render_scale,\n"
+	       "  fullscreen, filter, vsync, deadzone, right_stick_dpad, pad_mapping); flags override the file. See docs/OPTIONS.md\n";
 }
