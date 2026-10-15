@@ -33,6 +33,8 @@ static inline float f24(u32 v) { u32 b = v << 8; float f; memcpy(&f, &b, 4); ret
 static inline bool on(u32 cmd) { return R[cmd] & 1; }
 
 void ge_dump_stats() {
+	extern u64 g_cmd_hist[256];
+	for (int i = 0; i < 256; i++) if (g_cmd_hist[i] && i < 0x10) rt_log(LOG_GE, "  cmd %02x: %llu", i, (unsigned long long)g_cmd_hist[i]);
 	rt_log(LOG_GE, "GE: %llu prims", (unsigned long long)s_prims);
 }
 u64 ge_prim_count() { return s_prims; }
@@ -185,6 +187,7 @@ static void light_vertex(const float *posW, const float *nrmW, float *col) {
 	col[3] = std::min(255.0f, out[3]);
 }
 
+static Vtx transform_attrs(const VFormat &f, const u8 *p, float *pos, float *nrm, float *col, float *tc);
 static Vtx transform_vertex(const VFormat &f, const u8 *p) {
 	Vtx v{};
 	float pos[3] = {0, 0, 0}, nrm[3] = {0, 0, 1}, col[4], tc[2] = {0, 0};
@@ -210,8 +213,15 @@ static Vtx transform_vertex(const VFormat &f, const u8 *p) {
 		v.fog = 1;
 		return v;
 	}
+	return transform_attrs(f, p, pos, nrm, col, tc);
+}
+
+// Transform already-decoded model-space attributes (non-through). p (the raw
+// vertex, for skinning weights) may be null, e.g. for tessellated patch points.
+static Vtx transform_attrs(const VFormat &f, const u8 *p, float *pos, float *nrm, float *col, float *tc) {
+	Vtx v{};
 	// skinning
-	if (f.oW >= 0) {
+	if (f.oW >= 0 && p) {
 		float sp[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
 		for (int i = 0; i < f.nw; i++) {
 			float w = rdu(p + f.oW, f.wt, i, true);
@@ -222,8 +232,7 @@ static Vtx transform_vertex(const VFormat &f, const u8 *p) {
 			mul43n(boneM[i], nrm, tn);
 			for (int k = 0; k < 3; k++) { sp[k] += w * tp[k]; sn[k] += w * tn[k]; }
 		}
-		memcpy(pos, sp, 12);
-		memcpy(nrm, sn, 12);
+		for (int k = 0; k < 3; k++) { pos[k] = sp[k]; nrm[k] = sn[k]; }
 	}
 	float wp[3], wn[3], vp[3];
 	mul43(worldM, pos, wp);
@@ -1134,6 +1143,120 @@ static void draw_prim(u32 op) {
 	}
 }
 
+
+// ============================================================ Bezier patches (BEZIER, cmd 0x05)
+// Control points form an nu x nv grid of cubic patches (3n+1 points per side);
+// each patch is tessellated PATCHDIVISION times and drawn as triangles.
+// Semantics follow PPSSPP GPU/Common/SplineCommon.cpp.
+struct CtrlPt { float pos[3], nrm[3], col[4], tc[2]; };
+
+static void draw_bezier(u32 op) {
+	int nu = op & 0xFF, nv = (op >> 8) & 0xFF;
+	VFormat f = decode_vtype(R[0x12]);
+	int idxSize = f.idx == 1 ? 1 : f.idx == 2 ? 2 : f.idx == 3 ? 4 : 0;
+	int npts = nu * nv;
+	auto advance = [&] {
+		if (idxSize) s_iaddr += npts * idxSize;
+		else s_vaddr += npts * f.size * f.nm;
+	};
+	if (nu < 4 || nv < 4 || f.through) { advance(); return; }
+	setup_pipe(false);
+	s_pipe_cur = -1;
+	s_prims++;
+	static std::vector<CtrlPt> cp;
+	cp.resize(npts);
+	for (int i = 0; i < npts; i++) {
+		u32 index = idxSize == 1 ? LB(s_iaddr + i) : idxSize == 2 ? LH(s_iaddr + 2 * i) : idxSize == 4 ? LW(s_iaddr + 4 * i) : (u32)i;
+		const u8 *q = gptr(s_vaddr + index * f.size * f.nm);
+		CtrlPt &c = cp[i];
+		for (int k = 0; k < 3; k++) c.pos[k] = rd(q + f.oP, f.pos, k, true);
+		for (int k = 0; k < 3; k++) c.nrm[k] = f.oN >= 0 ? rd(q + f.oN, f.nrm, k, true) : 0;
+		if (f.oC >= 0) read_color(q + f.oC, f.col, c.col);
+		else { unpack_rgb(R[0x55], c.col); c.col[3] = R[0x58] & 255; }
+		c.tc[0] = f.oT >= 0 ? rdu(q + f.oT, f.tc, 0, true) : 0;
+		c.tc[1] = f.oT >= 0 ? rdu(q + f.oT, f.tc, 1, true) : 0;
+		if (f.oW >= 0) {  // skin control points before tessellating (as PPSSPP does)
+			float sp[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
+			for (int b = 0; b < f.nw; b++) {
+				float w = f.wt == 1 ? q[f.oW + b] / 128.0f : rdu(q + f.oW, f.wt, b, true);
+				if (w == 0) continue;
+				float tp[3], tn[3];
+				mul43(boneM[b], c.pos, tp);
+				mul43n(boneM[b], c.nrm, tn);
+				for (int k = 0; k < 3; k++) { sp[k] += w * tp[k]; sn[k] += w * tn[k]; }
+			}
+			for (int k = 0; k < 3; k++) { c.pos[k] = sp[k]; c.nrm[k] = sn[k]; }
+		}
+	}
+	advance();
+
+	int tu = std::max<int>(1, R[0x36] & 0x7F), tv = std::max<int>(1, (R[0x36] >> 8) & 0x7F);
+	static int dbgN = getenv("SSX_BZDEBUG") ? atoi(getenv("SSX_BZDEBUG")) : 0;
+	if (dbgN > 0 && rt_time_us() > 80000000) {
+		dbgN--;
+		rt_log(LOG_GE, "bezier %dx%d vt %06x idx %d div %dx%d prim %u facing %u cull %d/%u tex %d fmt %u | cp0 %.3f %.3f %.3f tc %.3f %.3f col %.0f %.0f %.0f %.0f | cpN %.3f %.3f %.3f",
+		       nu, nv, R[0x12], idxSize, tu, tv, R[0x37] & 3, R[0x38] & 1, on(0x1d), R[0x9b] & 1, P.tex, R[0xc3] & 15,
+		       cp[0].pos[0], cp[0].pos[1], cp[0].pos[2], cp[0].tc[0], cp[0].tc[1], cp[0].col[0], cp[0].col[1], cp[0].col[2], cp[0].col[3],
+		       cp[npts - 1].pos[0], cp[npts - 1].pos[1], cp[npts - 1].pos[2]);
+	}
+	bool reverseNormals = R[0x38] & 1;
+	int npu = (nu - 1) / 3, npv = (nv - 1) / 3;
+	auto bern = [](float t, float *b, float *d) {
+		float it = 1 - t;
+		b[0] = it * it * it; b[1] = 3 * t * it * it; b[2] = 3 * t * t * it; b[3] = t * t * t;
+		d[0] = -3 * it * it; d[1] = 9 * t * t - 12 * t + 3; d[2] = 3 * (2 - 3 * t) * t; d[3] = 3 * t * t;
+	};
+	bool cullOn = on(0x1d) && !P.clear;
+	int cullCCW = R[0x9b] & 1;
+	static std::vector<Vtx> grid;
+	grid.resize((tu + 1) * (tv + 1));
+	for (int pv = 0; pv < npv; pv++)
+		for (int pu = 0; pu < npu; pu++) {
+			const CtrlPt *base = &cp[pv * 3 * nu + pu * 3];
+			for (int j = 0; j <= tv; j++) {
+				float bv[4], dv[4];
+				bern((float)j / tv, bv, dv);
+				for (int i = 0; i <= tu; i++) {
+					float bu[4], du[4];
+					bern((float)i / tu, bu, du);
+					float pos[3] = {0, 0, 0}, nrm[3] = {0, 0, 0}, col[4] = {0, 0, 0, 0}, tc[2] = {0, 0};
+					float dpu[3] = {0, 0, 0}, dpv[3] = {0, 0, 0};
+					for (int y = 0; y < 4; y++)
+						for (int x = 0; x < 4; x++) {
+							const CtrlPt &c = base[y * nu + x];
+							float w = bu[x] * bv[y];
+							for (int k = 0; k < 3; k++) {
+								pos[k] += w * c.pos[k];
+								nrm[k] += w * c.nrm[k];
+								dpu[k] += du[x] * bv[y] * c.pos[k];
+								dpv[k] += bu[x] * dv[y] * c.pos[k];
+							}
+							for (int k = 0; k < 4; k++) col[k] += w * c.col[k];
+							tc[0] += w * c.tc[0];
+							tc[1] += w * c.tc[1];
+						}
+					if (f.oT < 0) { tc[0] = pu + (float)i / tu; tc[1] = pv + (float)j / tv; }
+					if (f.oN < 0) {
+						nrm[0] = dpu[1] * dpv[2] - dpu[2] * dpv[1];
+						nrm[1] = dpu[2] * dpv[0] - dpu[0] * dpv[2];
+						nrm[2] = dpu[0] * dpv[1] - dpu[1] * dpv[0];
+						if (reverseNormals) for (int k = 0; k < 3; k++) nrm[k] = -nrm[k];
+					}
+					Vtx &v = grid[j * (tu + 1) + i];
+					v = transform_attrs(f, nullptr, pos, nrm, col, tc);
+					if (v.z + v.w >= 0) to_screen(v);
+				}
+			}
+			for (int j = 0; j < tv; j++)
+				for (int i = 0; i < tu; i++) {
+					const Vtx &a = grid[j * (tu + 1) + i], &b = grid[j * (tu + 1) + i + 1];
+					const Vtx &c = grid[(j + 1) * (tu + 1) + i], &d = grid[(j + 1) * (tu + 1) + i + 1];
+					clip_and_draw(a, c, b, cullOn, cullCCW);
+					clip_and_draw(b, c, d, cullOn, cullCCW);
+				}
+		}
+}
+
 // ============================================================ block transfer (TRXKICK)
 void ge_flush();
 static void block_transfer() {
@@ -1151,14 +1274,17 @@ static void block_transfer() {
 }
 
 // ============================================================ command entry
+u64 g_cmd_hist[256];
 void ge_exec_cmd(u32 cmd, u32 op, u32 pc) {
 	(void)pc;
+	g_cmd_hist[cmd]++;
 	u32 data = op & 0xFFFFFF;
 	R[cmd] = data;
 	switch (cmd) {
 	case 0x01: s_vaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
 	case 0x02: s_iaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
 	case 0x04: draw_prim(data); break;
+	case 0x05: draw_bezier(data); break;
 	case 0x2a: boneN = data; break;
 	case 0x2b: if (boneN < 96) boneM[boneN / 12][boneN % 12] = f24(data); boneN++; break;
 	case 0x2c: case 0x2d: case 0x2e: case 0x2f: case 0x30: case 0x31: case 0x32: case 0x33:
