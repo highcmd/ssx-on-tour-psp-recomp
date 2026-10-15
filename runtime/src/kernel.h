@@ -47,6 +47,9 @@ void kernel_unschedule(int id);
 // Run a guest function in interrupt context (no blocking allowed). Returns v0.
 u32 kernel_call_interrupt(u32 func, u32 a0, u32 a1, u32 a2);
 
+// Thread-safe: queue fn to run on the scheduler (interrupt context) and wake it.
+void kernel_post_interrupt(std::function<void()> fn);
+
 // Callbacks
 void kernel_notify_callback(int cbid, u32 arg);
 

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "kernel.h"
+#include "settings.h"
 
 void rt_log_init();
 void memory_init();
@@ -18,8 +19,10 @@ extern std::string g_umd_root, g_ms_root, g_assetDir, g_iso_path;
 
 static void usage() {
 	fprintf(stderr,
-	        "usage: ssx [--umd <extracted UMD dir>] [--image <image.bin>] [--iso <umd.iso>] [--assets <dir>] [--headless]\n"
-	        "  keys: arrows=d-pad, Z=cross X=circle A=square S=triangle Q/E=L/R Enter=start Backspace=select IJKL=analog\n");
+	        "usage: ssx [--umd <extracted UMD dir>] [--image <image.bin>] [--iso <umd.iso>] [--assets <dir>] [--headless]\n%s"
+	        "  keys: arrows=d-pad, Z=cross X=circle A=square S=triangle Q/E=L/R Enter=start Backspace=select IJKL=analog, F11=fullscreen\n"
+	        "  gamepad (Xbox layout): A=cross B=circle X=square Y=triangle, LB/LT=L, RB/RT=R, Start, Back=select, left stick/d-pad\n",
+	        settings_usage());
 }
 
 static void on_term(int) {
@@ -37,8 +40,10 @@ int main(int argc, char **argv) {
 	g_umd_root = SSX_DEFAULT_UMD;
 	g_assetDir = SSX_DEFAULT_ASSETS;
 	g_iso_path = SSX_DEFAULT_ISO;
+	settings_load("ssx.ini");
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i];
+		if (settings_parse_arg(argc, argv, i)) continue;
 		auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(1); } return argv[++i]; };
 		if (a == "--umd") g_umd_root = next();
 		else if (a == "--image") image = next();

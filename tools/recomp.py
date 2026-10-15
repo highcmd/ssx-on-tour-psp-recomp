@@ -131,6 +131,12 @@ class FuncGen:
         if not self.rc.is_uncond(last):
             self.emit(self.rc.call_expr(self.end) + " return;")
         body = "\n".join(self.out)
+        hook = self.rc.hooks.get(self.start)
+        if hook:
+            # the original body keeps its labels; the public symbol goes through the hook
+            return (f"void {self.name}_orig(CPUState *c) {{\n{body}\n}}\n"
+                    f"void {hook}(CPUState *c, RecompFunc orig);\n"
+                    f"void {self.name}(CPUState *c) {{ {hook}(c, {self.name}_orig); }}\n")
         return f"void {self.name}(CPUState *c) {{\n{body}\n}}\n"
 
     def delay(self, a):
@@ -400,6 +406,9 @@ class Recompiler:
         self.jumptables = {int(k, 16): v["targets"] for k, v in fdata["jumptables"].items()}
         self.import_idx = {imp.stub: i for i, imp in enumerate(img.imports)}
         self.vfpu_used = set()
+        hooks_path = ROOT / "data" / "hooks.json"
+        hooks = json.load(open(hooks_path)) if hooks_path.exists() else {}
+        self.hooks = {int(k, 16): v for k, v in hooks.items() if not k.startswith("_")}
 
     def fname(self, a):
         return f"F_{a:08X}"

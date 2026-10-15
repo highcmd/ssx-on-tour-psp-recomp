@@ -1,23 +1,35 @@
 // sceDisplay + sceCtrl on SDL2. The PSP framebuffer lives in guest VRAM
 // (0x04000000); every vblank we convert it to RGBA and present it.
 #include <SDL2/SDL.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "kernel.h"
+#include "settings.h"
 
 static SDL_Window *s_win;
 static SDL_Renderer *s_ren;
 static SDL_Texture *s_tex;
-static SDL_GameController *s_pad;
 static u32 s_vcount;
 static u32 s_fb_addr, s_fb_width = 512, s_fb_fmt = 3;
 static u32 s_buttons;
 static u8 s_lx = 128, s_ly = 128;
 static u32 s_rgba[480 * 272];
-static int s_scale = 2;
 static bool s_headless;
+
+static std::vector<SDL_GameController *> s_pads;
+
+static void open_pad(int index) {
+	if (!SDL_IsGameController(index)) return;
+	SDL_GameController *p = SDL_GameControllerOpen(index);
+	if (!p) return;
+	for (auto *q : s_pads) if (q == p) return;
+	s_pads.push_back(p);
+	rt_log(LOG_DISPLAY, "gamepad connected: %s", SDL_GameControllerName(p));
+}
 
 void display_init(bool headless) {
 	s_headless = headless;
@@ -27,14 +39,18 @@ void display_init(bool headless) {
 		s_headless = true;
 		return;
 	}
-	if (const char *s = getenv("SSX_SCALE")) s_scale = atoi(s) > 0 ? atoi(s) : 2;
-	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 480 * s_scale,
-	                         272 * s_scale, SDL_WINDOW_RESIZABLE);
-	s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED);
-	SDL_RenderSetLogicalSize(s_ren, 480, 272);
+	const Settings &st = g_settings;
+	if (!st.padMapping.empty() && SDL_GameControllerAddMapping(st.padMapping.c_str()) < 0)
+		rt_log_error("pad_mapping rejected: %s", SDL_GetError());
+	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, st.linear ? "1" : "0");
+	u32 flags = SDL_WINDOW_RESIZABLE | (st.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, st.width, st.height, flags);
+	s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED | (st.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
+	SDL_RenderSetLogicalSize(s_ren, 480, 272);   // keeps the PSP aspect ratio (letterbox)
 	s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480, 272);
-	for (int i = 0; i < SDL_NumJoysticks(); i++)
-		if (SDL_IsGameController(i)) { s_pad = SDL_GameControllerOpen(i); break; }
+	for (int i = 0; i < SDL_NumJoysticks(); i++) open_pad(i);
+	rt_log(LOG_DISPLAY, "window %dx%d%s, filter %s, vsync %s, fps mode %d, %zu gamepad(s)", st.width, st.height,
+	       st.fullscreen ? " fullscreen" : "", st.linear ? "linear" : "nearest", st.vsync ? "on" : "off", st.fps, s_pads.size());
 }
 
 u32 display_vcount() { return s_vcount; }
@@ -169,8 +185,9 @@ static void update_buttons() {
 	if (k[SDL_SCANCODE_L]) lx = 255;
 	if (k[SDL_SCANCODE_I]) ly = 0;
 	if (k[SDL_SCANCODE_K]) ly = 255;
-	if (s_pad) {
-		auto btn = [&](SDL_GameControllerButton sb, u32 pb) { if (SDL_GameControllerGetButton(s_pad, sb)) b |= pb; };
+	const int dz = g_settings.deadzone;
+	for (SDL_GameController *pad : s_pads) {
+		auto btn = [&](SDL_GameControllerButton sb, u32 pb) { if (SDL_GameControllerGetButton(pad, sb)) b |= pb; };
 		btn(SDL_CONTROLLER_BUTTON_DPAD_UP, 0x10);
 		btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x20);
 		btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x40);
@@ -183,12 +200,25 @@ static void update_buttons() {
 		btn(SDL_CONTROLLER_BUTTON_B, 0x2000);
 		btn(SDL_CONTROLLER_BUTTON_A, 0x4000);
 		btn(SDL_CONTROLLER_BUTTON_X, 0x8000);
-		int ax = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_LEFTX);
-		int ay = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_LEFTY);
-		if (abs(ax) > 4000) lx = (ax + 32768) >> 8;
-		if (abs(ay) > 4000) ly = (ay + 32768) >> 8;
-		if (SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) b |= 0x100;
-		if (SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) b |= 0x200;
+		if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) b |= 0x100;
+		if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) b |= 0x200;
+		// left stick -> PSP analog nub, rescaled outside the deadzone
+		auto axis = [&](SDL_GameControllerAxis a) {
+			int v = SDL_GameControllerGetAxis(pad, a);
+			if (abs(v) < dz) return 128;
+			double n = (abs(v) - dz) / double(32767 - dz) * (v < 0 ? -1 : 1);
+			return std::clamp((int)lround(128 + n * 127.5), 0, 255);
+		};
+		int ax = axis(SDL_CONTROLLER_AXIS_LEFTX), ay = axis(SDL_CONTROLLER_AXIS_LEFTY);
+		if (ax != 128) lx = ax;
+		if (ay != 128) ly = ay;
+		if (g_settings.rightStickAsDpad) {
+			int rx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX), ry = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+			if (rx < -16000) b |= 0x80;
+			if (rx > 16000) b |= 0x20;
+			if (ry < -16000) b |= 0x10;
+			if (ry > 16000) b |= 0x40;
+		}
 	}
 	s_buttons = b;
 	s_lx = (u8)lx;
@@ -200,13 +230,48 @@ void display_pump_events() {
 	SDL_Event e;
 	while (SDL_PollEvent(&e)) {
 		if (e.type == SDL_QUIT) kernel_request_exit();
-		if (e.type == SDL_CONTROLLERDEVICEADDED && !s_pad) s_pad = SDL_GameControllerOpen(e.cdevice.which);
+		if (e.type == SDL_CONTROLLERDEVICEADDED) open_pad(e.cdevice.which);
+		if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+			for (size_t i = 0; i < s_pads.size(); i++)
+				if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(s_pads[i])) == e.cdevice.which) {
+					rt_log(LOG_DISPLAY, "gamepad disconnected: %s", SDL_GameControllerName(s_pads[i]));
+					SDL_GameControllerClose(s_pads[i]);
+					s_pads.erase(s_pads.begin() + i);
+					break;
+				}
+		}
+		if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11) {
+			bool fs = SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+			SDL_SetWindowFullscreen(s_win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+		}
 	}
 	update_buttons();
 }
 
+u64 g_frames_finished;   // GE FINISH count (game frames), for the FPS meter
 void display_on_vblank() {
 	s_vcount++;
+	static u64 lastT, lastF;
+	static double fpsEvery = getenv("SSX_FPS") ? atof(getenv("SSX_FPS")) : 0;
+	u64 now = rt_time_us();
+	if (fpsEvery > 0 && now - lastT >= fpsEvery * 1e6) {
+		extern u64 g_frames_finished;
+		extern u64 g_ge_flushes, g_ge_jobs;
+		static u64 lastFl, lastJ;
+		u64 fr = g_frames_finished - lastF;
+		if (lastT && fr) rt_log(LOG_DISPLAY, "fps %.1f flushes/frame %.1f jobs/frame %.0f", fr * 1e6 / (now - lastT),
+		                        double(g_ge_flushes - lastFl) / fr, double(g_ge_jobs - lastJ) / fr);
+		lastFl = g_ge_flushes; lastJ = g_ge_jobs;
+		extern u64 g_prof_guest, g_prof_ge, g_prof_flush;
+		static u64 lg, lge, lfl;
+		if (fr) rt_log(LOG_DISPLAY, "  per frame ms: guest-thread time %.1f (of which GE transform %.1f, raster flush %.1f)",
+		               (g_prof_guest - lg) / 1e3 / fr, (g_prof_ge - lge) / 1e3 / fr, (g_prof_flush - lfl) / 1e3 / fr);
+		lg = g_prof_guest; lge = g_prof_ge; lfl = g_prof_flush;
+		extern u64 g_flush_why[8];
+		rt_log(LOG_DISPLAY, "  flush reasons: vram-tex %llu tex-redecode %llu blit %llu", (unsigned long long)g_flush_why[1], (unsigned long long)g_flush_why[2], (unsigned long long)g_flush_why[3]);
+		lastT = now;
+		lastF = g_frames_finished;
+	}
 	display_pump_events();
 	display_present();
 }
@@ -225,9 +290,20 @@ HLE(sceDisplay, sceDisplaySetFrameBuf) {
 	RET(0);
 }
 
-HLE(sceDisplay, sceDisplayGetVcount) { RET(s_vcount); }
+HLE(sceDisplay, sceDisplayGetVcount) {
+	static double vbTrace = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
+	static int n;
+	if (vbTrace >= 0 && rt_time_us() / 1e6 >= vbTrace && n++ < 40) rt_log(LOG_DISPLAY, "GetVcount ra=%08x -> %u", c->r[31], s_vcount);
+	RET(s_vcount);
+}
 
 HLE(sceDisplay, sceDisplayWaitVblankStart) {
+	static double vbTrace = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
+	static int vbn;
+	if (vbTrace >= 0 && rt_time_us() / 1e6 >= vbTrace && vbn++ < 40) {
+		extern u64 g_frames_finished;
+		rt_log(LOG_DISPLAY, "WaitVblank ra=%08x vcount=%u frames=%llu t=%.2fms", c->r[31], s_vcount, (unsigned long long)g_frames_finished, rt_time_us() / 1e3);
+	}
 	kernel_wait(WAIT_VBLANK, 0, 0, false);
 	RET(0);
 }
