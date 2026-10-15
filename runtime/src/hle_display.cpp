@@ -18,7 +18,10 @@ static u32 s_vcount;
 static u32 s_fb_addr, s_fb_width = 512, s_fb_fmt = 3;
 static u32 s_buttons;
 static u8 s_lx = 128, s_ly = 128;
-static u32 s_rgba[480 * 272];
+static std::vector<u32> s_rgba(480 * 272);
+static int s_tex_scale = 1;
+const u32 *ge_shadow_for_display(u32 fbAddr, u32 *stride, int *scale);
+extern int g_render_scale;
 static bool s_headless;
 
 static std::vector<SDL_GameController *> s_pads;
@@ -34,7 +37,12 @@ static void open_pad(int index) {
 
 void display_init(bool headless) {
 	s_headless = headless;
-	if (headless) return;
+	if (headless) {
+		s_tex_scale = g_render_scale;
+		s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
+		return;
+	}
+	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   // our own SIGINT handler quits at once
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
 		rt_log_error("SDL_Init: %s", SDL_GetError());
 		s_headless = true;
@@ -48,13 +56,21 @@ void display_init(bool headless) {
 	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, st.width, st.height, flags);
 	s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED | (st.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
 	SDL_RenderSetLogicalSize(s_ren, 480, 272);   // keeps the PSP aspect ratio (letterbox)
-	s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480, 272);
+	g_render_scale = settings_render_scale();
+	s_tex_scale = g_render_scale;
+	s_rgba.assign((size_t)480 * 272 * s_tex_scale * s_tex_scale, 0);
+	s_tex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480 * s_tex_scale, 272 * s_tex_scale);
 	for (int i = 0; i < SDL_NumJoysticks(); i++) open_pad(i);
+	rt_log(LOG_DISPLAY, "internal resolution %dx%d (render scale %d)", 480 * g_render_scale, 272 * g_render_scale, g_render_scale);
 	rt_log(LOG_DISPLAY, "window %dx%d%s, filter %s, vsync %s, fps mode %d, %zu gamepad(s)", st.width, st.height,
 	       st.fullscreen ? " fullscreen" : "", st.linear ? "linear" : "nearest", st.vsync ? "on" : "off", st.fps, s_pads.size());
 }
 
 u32 display_vcount() { return s_vcount; }
+
+void platform_shutdown() {
+	if (s_win) SDL_Quit();
+}
 
 static inline u32 conv(u32 fmt, u32 p) {
 	u32 r, g, b;
@@ -74,25 +90,42 @@ static inline u32 conv(u32 fmt, u32 p) {
 	return 0xFF000000u | (b << 16) | (g << 8) | r;
 }
 
-static void convert_fb() {
+// Fills s_rgba (480S x 272S) and returns S actually used (1 when VRAM is shown).
+static int convert_fb() {
+	u32 sstride = 0;
+	int sc = 1;
+	const u32 *sh = ge_shadow_for_display(s_fb_addr, &sstride, &sc);
+	if (sh && sc == s_tex_scale) {
+		int W = 480 * sc, H = 272 * sc;
+		for (int y = 0; y < H; y++) {
+			const u32 *src = sh + (size_t)y * sstride;
+			u32 *dst = s_rgba.data() + (size_t)y * W;
+			for (int x = 0; x < W; x++) dst[x] = src[x] | 0xFF000000u;
+		}
+		return sc;
+	}
 	u32 bpp = s_fb_fmt == 3 ? 4 : 2;
 	const u8 *src = gptr(s_fb_addr);
+	int S = s_tex_scale, W = 480 * S;
 	for (int y = 0; y < 272; y++) {
 		const u8 *row = src + (size_t)y * s_fb_width * bpp;
-		u32 *dst = s_rgba + y * 480;
-		if (bpp == 4) {
-			for (int x = 0; x < 480; x++) { u32 p; memcpy(&p, row + x * 4, 4); dst[x] = p | 0xFF000000u; }
-		} else {
-			for (int x = 0; x < 480; x++) { u16 p; memcpy(&p, row + x * 2, 2); dst[x] = conv(s_fb_fmt, p); }
+		for (int x = 0; x < 480; x++) {
+			u32 c;
+			if (bpp == 4) { memcpy(&c, row + x * 4, 4); c |= 0xFF000000u; }
+			else { u16 p; memcpy(&p, row + x * 2, 2); c = conv(s_fb_fmt, p); }
+			for (int dy = 0; dy < S; dy++)
+				for (int dx = 0; dx < S; dx++) s_rgba[(size_t)(y * S + dy) * W + x * S + dx] = c;
 		}
 	}
+	return 1;
 }
 
 static void write_ppm(const char *path) {
 	FILE *f = fopen(path, "wb");
 	if (!f) return;
-	fprintf(f, "P6\n480 272\n255\n");
-	for (int i = 0; i < 480 * 272; i++) {
+	int W = 480 * s_tex_scale, H = 272 * s_tex_scale;
+	fprintf(f, "P6\n%d %d\n255\n", W, H);
+	for (int i = 0; i < W * H; i++) {
 		u8 px[3] = {(u8)(s_rgba[i] & 255), (u8)((s_rgba[i] >> 8) & 255), (u8)((s_rgba[i] >> 16) & 255)};
 		fwrite(px, 1, 3, f);
 	}
@@ -114,7 +147,7 @@ void display_present() {
 		next += every;
 	}
 	if (s_headless) return;
-	SDL_UpdateTexture(s_tex, nullptr, s_rgba, 480 * 4);
+	SDL_UpdateTexture(s_tex, nullptr, s_rgba.data(), 480 * s_tex_scale * 4);
 	SDL_RenderClear(s_ren);
 	SDL_RenderCopy(s_ren, s_tex, nullptr, nullptr);
 	SDL_RenderPresent(s_ren);
@@ -278,6 +311,12 @@ void display_on_vblank() {
 		u64 px = g_raster_px.load(), ns = g_raster_ns.load();
 		if (px > lpx) rt_log(LOG_DISPLAY, "  raster: %.0f px/frame, %.1f ns/px (thread time), %.1f ms worker-time/frame", double(px - lpx) / fr, double(ns - lns) / double(px - lpx), (ns - lns) / 1e6 / fr);
 		lpx = px; lns = ns;
+		extern u64 g_ge_cmd_count;
+		static u64 lcmd;
+		rt_log(LOG_DISPLAY, "  GE cmds/frame %.0f", double(g_ge_cmd_count - lcmd) / std::max<u64>(fr, 1));
+		lcmd = g_ge_cmd_count;
+		extern u64 g_sh_create, g_sh_upload, g_sh_resolve;
+		rt_log(LOG_DISPLAY, "  shadows: created %llu uploads %llu resolves %llu", (unsigned long long)g_sh_create, (unsigned long long)g_sh_upload, (unsigned long long)g_sh_resolve);
 		extern u64 g_flush_why[8];
 		rt_log(LOG_DISPLAY, "  flush reasons: vram-tex %llu tex-redecode %llu blit %llu", (unsigned long long)g_flush_why[1], (unsigned long long)g_flush_why[2], (unsigned long long)g_flush_why[3]);
 		lastT = now;

@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <condition_variable>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <pthread.h>
@@ -28,13 +30,14 @@ static u32 s_vaddr, s_iaddr;
 static u64 s_prims;
 static int s_traceState;   // 0 idle, 1 armed (wait FINISH), 2 tracing, 3 done
 extern u32 g_ge_base, g_ge_offset;
+extern int g_render_scale;
 
 static inline float f24(u32 v) { u32 b = v << 8; float f; memcpy(&f, &b, 4); return f; }
 static inline bool on(u32 cmd) { return R[cmd] & 1; }
 
 void ge_dump_stats() {
 	extern u64 g_cmd_hist[256];
-	for (int i = 0; i < 256; i++) if (g_cmd_hist[i] && i < 0x10) rt_log(LOG_GE, "  cmd %02x: %llu", i, (unsigned long long)g_cmd_hist[i]);
+	for (int i = 0; i < 256; i++) if (g_cmd_hist[i] > 1000000) rt_log(LOG_GE, "  cmd %02x: %llu", i, (unsigned long long)g_cmd_hist[i]);
 	rt_log(LOG_GE, "GE: %llu prims", (unsigned long long)s_prims);
 }
 u64 ge_prim_count() { return s_prims; }
@@ -203,7 +206,7 @@ static Vtx transform_vertex(const VFormat &f, const u8 *p) {
 	else { unpack_rgb(R[0x55], col); col[3] = R[0x58] & 255; }
 
 	if (f.through) {
-		v.sx = pos[0]; v.sy = pos[1]; v.sz = pos[2];
+		v.sx = pos[0] * g_render_scale; v.sy = pos[1] * g_render_scale; v.sz = pos[2];
 		// through mode: z is unsigned (u8/u16), only x/y are signed
 		if (f.pos == 2) { u16 z; memcpy(&z, p + f.oP + 4, 2); v.sz = z; }
 		else if (f.pos == 1) v.sz = p[f.oP + 2];
@@ -282,8 +285,8 @@ static Vtx transform_attrs(const VFormat &f, const u8 *p, float *pos, float *nrm
 static void to_screen(Vtx &v) {
 	float iw = v.w != 0 ? 1.0f / v.w : 0;
 	float ox = (R[0x4c] & 0xFFFF) / 16.0f, oy = (R[0x4d] & 0xFFFF) / 16.0f;
-	v.sx = f24(R[0x45]) + f24(R[0x42]) * v.x * iw - ox;
-	v.sy = f24(R[0x46]) + f24(R[0x43]) * v.y * iw - oy;
+	v.sx = (f24(R[0x45]) + f24(R[0x42]) * v.x * iw - ox) * g_render_scale;
+	v.sy = (f24(R[0x46]) + f24(R[0x43]) * v.y * iw - oy) * g_render_scale;
 	v.sz = f24(R[0x47]) + f24(R[0x44]) * v.z * iw;
 }
 
@@ -383,11 +386,19 @@ void ge_flush();
 static bool jobs_pending();
 static bool jobs_overlap(u32 addr, u32 size);
 static bool running_overlap(u32 addr, u32 size);
+struct Shadow;
+static Shadow *shadow_covering(u32 vaddr, u32 size);
+static void resolve_shadow(Shadow &sh);
+static bool shadow_dirty(const Shadow *sh);
 extern u64 g_flush_why[8];
 static const u32 *get_texture(const TexInfo &t) {
 	// render-to-texture: draw pending pixels first if they target this texture's memory
 	if ((t.addr & 0x0F000000) == 0x04000000 &&
 	    (jobs_overlap(t.addr & 0x1FFFFFFF, 0x80000) || running_overlap(t.addr & 0x1FFFFFFF, 0x80000))) { g_flush_why[1]++; ge_flush(); }
+	if (g_render_scale > 1 && (t.addr & 0x0F000000) == 0x04000000) {
+		Shadow *sh = shadow_covering(t.addr & 0x1FFFFFFF, t.bufw * t.h * 4);
+		if (sh && shadow_dirty(sh)) { ge_flush(); resolve_shadow(*sh); }
+	}
 	int bits = s_bpp_bits[t.fmt];
 	bool isClut = t.fmt >= 4 && t.fmt <= 7;
 	u32 rowBytes = t.bufw * bits / 8;
@@ -426,9 +437,11 @@ static const u32 *get_texture(const TexInfo &t) {
 
 // ============================================================ framebuffer access
 struct Target {
-	u8 *fb;
+	u8 *fb;            // where pixels go: VRAM, or the high-resolution shadow (then fmt = 3)
 	u16 *zb;
 	u32 stride, zstride, fmt;
+	u32 vfb, vzb;      // guest VRAM addresses (offsets from g_mem) of the real buffers
+	u32 vstride, vzstride, vfmt;
 };
 
 static inline u32 fb_read(const Target &t, int x, int y) {
@@ -455,17 +468,174 @@ static inline void fb_write(const Target &t, int x, int y, u32 c, u32 mask) {
 	*p = (*p & m16) | (v & ~m16);
 }
 
+// ---------------------------------------------------------------- high-resolution shadows
+// With render scale S > 1 every colour/depth buffer the GE draws into gets an
+// S x S larger shadow (always RGBA8888 / u16). Drawing happens there; the
+// display shows it directly. When the game needs the real VRAM contents
+// (texture from a rendered buffer, block transfer) the shadow is averaged down.
+int g_render_scale = 1;
+struct Shadow {
+	u32 base, stride, fmt;        // VRAM offset, stride (pixels), PSP pixel format
+	int S;
+	std::vector<u32> px;          // (stride*S) x (512*S)
+	std::vector<u16> z;
+	bool depth = false;
+	int maxRow = -1;              // highest VRAM row drawn (for resolve / overlap checks)
+	int dx0 = 1 << 30, dy0 = 1 << 30, dx1 = -1, dy1 = -1;   // drawn rectangle (VRAM pixels) since last resolve
+	bool needsResolve = false;    // shadow newer than VRAM
+	bool vramNewer = false;       // VRAM newer than shadow (block transfer into it)
+	u64 lastDrawUs = 0;
+};
+static std::mutex s_shadow_mtx;
+u64 g_sh_create, g_sh_upload, g_sh_resolve;
+static std::map<u32, std::unique_ptr<Shadow>> s_shadows;   // colour, by VRAM offset
+static std::map<u32, std::unique_ptr<Shadow>> s_zshadows;  // depth
+
+static bool shadow_dirty(const Shadow *sh) { return sh->needsResolve && !sh->depth; }
+static u32 vram_bytes(const Shadow &sh) { return sh.stride * (sh.depth ? 2 : (sh.fmt == 3 ? 4 : 2)); }
+
+static Shadow *get_shadow(std::map<u32, std::unique_ptr<Shadow>> &m, u32 base, u32 stride, u32 fmt, bool depth) {
+	std::lock_guard<std::mutex> lk(s_shadow_mtx);
+	auto &sp = m[base];
+	int S = g_render_scale;
+	if (!sp || sp->stride != stride || sp->fmt != fmt || sp->S != S) {
+		sp = std::make_unique<Shadow>();
+		g_sh_create++;
+		if (getenv("SSX_SHDBG")) rt_log(LOG_GE, "shadow create %s base %06x stride %u fmt %u", depth ? "Z" : "C", base & 0x1FFFFF, stride, fmt);
+		sp->base = base; sp->stride = stride; sp->fmt = fmt; sp->S = S; sp->depth = depth;
+		if (depth) sp->z.assign((size_t)stride * S * 512 * S, 0xFFFF);
+		else sp->px.assign((size_t)stride * S * 512 * S, fmt == 0 ? 0xFF000000u : 0);
+		sp->vramNewer = true;   // start from whatever VRAM holds
+	}
+	return sp.get();
+}
+
+// VRAM -> shadow (nearest upscale)
+static void upload_shadow(Shadow &sh) {
+	g_sh_upload++;
+	int S = sh.S;
+	u32 W = sh.stride * S;
+	for (u32 y = 0; y < 512; y++) {
+		const u8 *row = gptr(0x04000000 | sh.base) + (size_t)y * vram_bytes(sh);
+		if ((size_t)(sh.base & 0x1FFFFF) + (size_t)(y + 1) * vram_bytes(sh) > 0x200000) break;
+		for (u32 x = 0; x < sh.stride; x++) {
+			if (sh.depth) {
+				u16 v; memcpy(&v, row + x * 2, 2);
+				for (int dy = 0; dy < S; dy++) for (int dx = 0; dx < S; dx++) sh.z[(size_t)(y * S + dy) * W + x * S + dx] = v;
+			} else {
+				u32 c;
+				if (sh.fmt == 3) memcpy(&c, row + x * 4, 4);
+				else { u16 v; memcpy(&v, row + x * 2, 2); c = sh.fmt == 0 ? c565(v) : sh.fmt == 1 ? c5551(v) : c4444(v); }
+				for (int dy = 0; dy < S; dy++) for (int dx = 0; dx < S; dx++) sh.px[(size_t)(y * S + dy) * W + x * S + dx] = c;
+			}
+		}
+	}
+	sh.vramNewer = false;
+}
+
+// Run fn(y) for y in [y0, y1] on a few helper threads.
+template <class F>
+static void parallel_rows(int y0, int y1, F fn) {
+	int n = y1 - y0 + 1;
+	if (n <= 0) return;
+	int nt = std::min(8, std::max(1, n / 16));
+	std::vector<std::thread> ts;
+	for (int t = 1; t < nt; t++)
+		ts.emplace_back([&, t] { for (int y = y0 + t; y <= y1; y += nt) fn(y); });
+	for (int y = y0; y <= y1; y += nt) fn(y);
+	for (auto &th : ts) th.join();
+}
+
+// shadow -> VRAM (box filter)
+static void resolve_shadow(Shadow &sh) {
+	if (!sh.needsResolve || sh.depth) { sh.needsResolve = false; return; }
+	g_sh_resolve++;
+	int S = sh.S;
+	u32 W = sh.stride * S;
+	Target t{};
+	t.fmt = sh.fmt;
+	t.stride = sh.stride;
+	t.fb = gptr(0x04000000 | sh.base);
+	int x0 = std::max(sh.dx0, 0), x1 = std::min(sh.dx1, (int)sh.stride - 1);
+	int y0 = std::max(sh.dy0, 0), y1 = std::min(sh.dy1, 511);
+	parallel_rows(y0, y1, [&](int y) {
+		for (int x = x0; x <= x1; x++) {
+			u32 acc[4] = {0, 0, 0, 0};
+			for (int dy = 0; dy < S; dy++)
+				for (int dx = 0; dx < S; dx++) {
+					u32 c = sh.px[(size_t)(y * S + dy) * W + x * S + dx];
+					for (int k = 0; k < 4; k++) acc[k] += (c >> (8 * k)) & 255;
+				}
+			u32 c = 0;
+			for (int k = 0; k < 4; k++) c |= (acc[k] / (S * S)) << (8 * k);
+			fb_write(t, x, y, c, 0);
+		}
+	});
+	sh.needsResolve = false;
+	sh.dx0 = sh.dy0 = 1 << 30;
+	sh.dx1 = sh.dy1 = -1;
+}
+
+static Shadow *shadow_covering(u32 vaddr, u32 size) {
+	std::lock_guard<std::mutex> lk(s_shadow_mtx);
+	for (auto &[base, sh] : s_shadows) {
+		u32 hi = base + vram_bytes(*sh) * (u32)(sh->maxRow + 1);
+		if (vaddr < hi && base < vaddr + size) return sh.get();
+	}
+	return nullptr;
+}
+
+// End of a frame (FINISH): bring VRAM up to date with everything drawn, so a
+// stale shadow can never overwrite memory the game reuses later.
+void ge_resolve_all() {
+	if (g_render_scale <= 1) return;
+	std::vector<Shadow *> todo;
+	{
+		std::lock_guard<std::mutex> lk(s_shadow_mtx);
+		for (auto &[b, sh] : s_shadows) if (sh->needsResolve) todo.push_back(sh.get());
+	}
+	for (Shadow *sh : todo) resolve_shadow(*sh);
+}
+
+// Called from the display: the high-resolution picture for a framebuffer, if it is current.
+const u32 *ge_shadow_for_display(u32 fbAddr, u32 *stride, int *scale) {
+	if (g_render_scale <= 1) return nullptr;
+	std::lock_guard<std::mutex> lk(s_shadow_mtx);
+	auto it = s_shadows.find(fbAddr & 0x1FFFFFFF);
+	if (it == s_shadows.end() || rt_time_us() - it->second->lastDrawUs > 200000) return nullptr;
+	*stride = it->second->stride * it->second->S;
+	*scale = it->second->S;
+	return it->second->px.data();
+}
+
 static Target current_target() {
 	Target t;
 	u32 fbp = (R[0x9c] & 0xFFFFF0) | ((R[0x9d] & 0xFF0000) << 8);
 	u32 zbp = (R[0x9e] & 0xFFFFF0) | ((R[0x9f] & 0xFF0000) << 8);
-	t.fb = gptr(0x04000000 | (fbp & 0x1FFFFF));
-	t.zb = (u16 *)gptr(0x04000000 | (zbp & 0x1FFFFF));
-	t.stride = R[0x9d] & 0x7FC;
-	t.zstride = R[0x9f] & 0x7FC;
-	t.fmt = R[0xd2] & 3;
-	if (!t.stride) t.stride = 512;
-	if (!t.zstride) t.zstride = 512;
+	t.vfb = 0x04000000 | (fbp & 0x1FFFFF);
+	t.vzb = 0x04000000 | (zbp & 0x1FFFFF);
+	t.vstride = R[0x9d] & 0x7FC;
+	t.vzstride = R[0x9f] & 0x7FC;
+	t.vfmt = R[0xd2] & 3;
+	if (!t.vstride) t.vstride = 512;
+	if (!t.vzstride) t.vzstride = 512;
+	if (g_render_scale <= 1) {
+		t.fb = gptr(t.vfb);
+		t.zb = (u16 *)gptr(t.vzb);
+		t.stride = t.vstride; t.zstride = t.vzstride; t.fmt = t.vfmt;
+		return t;
+	}
+	int S = g_render_scale;
+	Shadow *cs = get_shadow(s_shadows, t.vfb, t.vstride, t.vfmt, false);
+	Shadow *zs = get_shadow(s_zshadows, t.vzb, t.vzstride, 0, true);
+	if (cs->vramNewer) upload_shadow(*cs);
+	if (zs->vramNewer) upload_shadow(*zs);
+	cs->lastDrawUs = rt_time_us();
+	t.fb = (u8 *)cs->px.data();
+	t.zb = zs->z.data();
+	t.stride = t.vstride * S;
+	t.zstride = t.vzstride * S;
+	t.fmt = 3;
 	return t;
 }
 
@@ -491,6 +661,7 @@ struct Pipe {
 	int minZ, maxZ;
 	unsigned spec;   // specialisation key (see shade_t), GENERIC for clear/stencil
 	u16 mask16;      // writeMask converted to the 16-bit framebuffer format
+	struct Shadow *shadow = nullptr;   // colour shadow being drawn into (render scale > 1)
 };
 static Pipe P;
 
@@ -506,8 +677,13 @@ static void setup_pipe(bool through) {
 	p.tgt = current_target();
 	p.sx0 = R[0xd4] & 0x3FF; p.sy0 = (R[0xd4] >> 10) & 0x3FF;
 	p.sx1 = R[0xd5] & 0x3FF; p.sy1 = (R[0xd5] >> 10) & 0x3FF;
+	{
+		int S = g_render_scale;
+		p.sx0 *= S; p.sy0 *= S;
+		p.sx1 = (p.sx1 + 1) * S - 1; p.sy1 = (p.sy1 + 1) * S - 1;
+	}
 	p.sx1 = std::min<int>(p.sx1, p.tgt.stride - 1);
-	p.sy1 = std::min(p.sy1, 511);
+	p.sy1 = std::min(p.sy1, 512 * g_render_scale - 1);
 	p.through = through;
 	p.clear = R[0xd3] & 1;
 	p.clearColor = R[0xd3] & 0x100; p.clearAlpha = R[0xd3] & 0x200; p.clearDepth = R[0xd3] & 0x400;
@@ -550,7 +726,14 @@ static void setup_pipe(bool through) {
 	} else {
 		p.writeMask = (R[0xe8] & 0xFFFFFF) | ((R[0xe9] & 255) << 24);
 	}
+	if (g_render_scale > 1 && p.tgt.vfmt == 0) p.writeMask |= 0xFF000000u;   // 565: keep shadow alpha opaque
 	p.minZ = R[0xd6] & 0xFFFF; p.maxZ = R[0xd7] & 0xFFFF;
+	if (g_render_scale > 1) {
+		std::lock_guard<std::mutex> lk(s_shadow_mtx);
+		auto it = s_shadows.find(p.tgt.vfb);
+		p.shadow = it != s_shadows.end() ? it->second.get() : nullptr;
+		if (it != s_shadows.end()) it->second->maxRow = std::max(it->second->maxRow, std::min(511, (p.sy1 + 1) / g_render_scale - 1));
+	}
 	{
 		u32 mask = p.writeMask;
 		p.mask16 = p.tgt.fmt == 0 ? (u16)(((mask & 0xF8) >> 3) | ((mask & 0xFC00) >> 5) | ((mask & 0xF80000) >> 8))
@@ -749,7 +932,7 @@ __attribute__((always_inline)) static inline void shade_t(const Pipe &p, int x, 
 // ============================================================ rasterisation
 // Each worker rasterises only the rows of its bands, so per-pixel order is kept.
 static const int BAND_SHIFT = 4;           // 16-row bands
-static const int NBANDS = 512 >> BAND_SHIFT;
+static const int NBANDS = (512 * 6) >> BAND_SHIFT;   // up to render scale 6
 template <unsigned F>
 static void raster_sprite_t(const Pipe &P, const Vtx &a, const Vtx &b, int ylo, int yhi) {
 	float x0 = a.sx, y0 = a.sy, x1 = b.sx, y1 = b.sy;
@@ -803,7 +986,20 @@ static void raster_triangle_t(const Pipe &P, const Vtx &v0, const Vtx &v1, const
 		float py = y + 0.5f, px = minx + 0.5f;
 		float e0 = ((v2.sx - v1.sx) * (py - v1.sy) - (v2.sy - v1.sy) * (px - v1.sx)) * ia;
 		float e1 = ((v0.sx - v2.sx) * (py - v2.sy) - (v0.sy - v2.sy) * (px - v2.sx)) * ia;
-		for (int x = minx; x <= maxx; x++, e0 += d0, e1 += d1) {
+		// Exact covered span of this row: each edge function is affine in x.
+		float lo = 0, hi = (float)(maxx - minx);
+		auto clip_edge = [&](float e, float d, float b) {
+			if (d > 1e-12f) lo = std::max(lo, (b - e) / d);
+			else if (d < -1e-12f) hi = std::min(hi, (b - e) / d);
+			else if (e < b) hi = -1;
+		};
+		clip_edge(e0, d0, b0);
+		clip_edge(e1, d1, b1);
+		clip_edge(1.0f - e0 - e1, -d0 - d1, b2);
+		if (hi < lo) continue;
+		int xs = std::max(0, (int)ceilf(lo) - 1), xe = std::min(maxx - minx, (int)floorf(hi) + 1);
+		e0 += d0 * xs; e1 += d1 * xs;
+		for (int x = minx + xs; x <= minx + xe; x++, e0 += d0, e1 += d1) {
 			float e2 = 1.0f - e0 - e1;
 			if (e0 < b0 || e1 < b1 || e2 < b2) continue;
 			float z = e0 * v0.sz + e1 * v1.sz + e2 * v2.sz;
@@ -857,9 +1053,9 @@ static bool jobs_overlap(u32 addr, u32 size) {
 	return false;
 }
 static void note_target(const Pipe &p) {
-	u32 fb = (u32)(p.tgt.fb - g_mem), zb = (u32)((u8 *)p.tgt.zb - g_mem);
-	u32 rows = (u32)p.sy1 + 1;
-	Range a{fb, fb + p.tgt.stride * rows * (p.tgt.fmt == 3 ? 4 : 2)}, b{zb, zb + p.tgt.zstride * rows * 2};
+	u32 fb = p.tgt.vfb & 0x1FFFFFFF, zb = p.tgt.vzb & 0x1FFFFFFF;
+	u32 rows = (u32)(p.sy1 + 1) / g_render_scale;
+	Range a{fb, fb + p.tgt.vstride * rows * (p.tgt.vfmt == 3 ? 4 : 2)}, b{zb, zb + p.tgt.vzstride * rows * 2};
 	for (const Range &r : {a, b}) {
 		bool known = false;
 		for (const Range &d : s_dirty) if (d.lo == r.lo && d.hi == r.hi) known = true;
@@ -976,6 +1172,17 @@ void ge_flush() {
 	g_prof_flush += rt_time_us() - t0;
 }
 
+// Grow the drawn rectangle of the current colour shadow (scaled coords -> VRAM pixels).
+static void note_drawn(float fx0, int y0, float fx1, int y1) {
+	Shadow *sh = P.shadow;
+	if (!sh) return;
+	int S = g_render_scale;
+	int x0 = std::max((int)floorf(fx0), P.sx0) / S, x1 = std::min((int)ceilf(fx1), P.sx1) / S;
+	sh->needsResolve = true;
+	sh->dx0 = std::min(sh->dx0, x0); sh->dx1 = std::max(sh->dx1, x1);
+	sh->dy0 = std::min(sh->dy0, y0 / S); sh->dy1 = std::max(sh->dy1, y1 / S);
+}
+
 static void emit_triangle(const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &flat) {
 	if (s_pipe_cur < 0) { s_pipes.push_back(P); s_pipe_cur = (int)s_pipes.size() - 1; note_target(P); }
 	Job j;
@@ -984,10 +1191,11 @@ static void emit_triangle(const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &f
 	j.v[0] = a; j.v[1] = b; j.v[2] = c; j.v[3] = flat;
 	int y0 = std::max((int)floorf(std::min({a.sy, b.sy, c.sy})), P.sy0);
 	int y1 = std::min((int)ceilf(std::max({a.sy, b.sy, c.sy})), P.sy1);
-	if (y0 > y1 || y1 < 0 || y0 > 511) return;
+	if (y0 > y1 || y1 < 0 || y0 > 512 * g_render_scale - 1) return;
 	u32 idx = (u32)s_jobs.size();
 	s_jobs.push_back(j);
-	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 511) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
+	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 512 * g_render_scale - 1) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
+	note_drawn(std::min({a.sx, b.sx, c.sx}), y0, std::max({a.sx, b.sx, c.sx}), y1);
 	if (s_jobs.size() >= 4096) ge_submit();
 }
 
@@ -998,10 +1206,11 @@ static void draw_sprite(const Vtx &a, const Vtx &b) {
 	j.kind = 1;
 	j.v[0] = a; j.v[1] = b;
 	int y0 = std::max((int)floorf(std::min(a.sy, b.sy)), P.sy0), y1 = std::min((int)ceilf(std::max(a.sy, b.sy)), P.sy1);
-	if (y0 > y1 || y1 < 0 || y0 > 511) return;
+	if (y0 > y1 || y1 < 0 || y0 > 512 * g_render_scale - 1) return;
 	u32 idx = (u32)s_jobs.size();
 	s_jobs.push_back(j);
-	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 511) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
+	for (int bnd = std::max(y0, 0) >> BAND_SHIFT; bnd <= (std::min(y1, 512 * g_render_scale - 1) >> BAND_SHIFT); bnd++) s_band[bnd].push_back(idx);
+	note_drawn(std::min(a.sx, b.sx), y0, std::max(a.sx, b.sx), y1);
 }
 
 // Clip a triangle against the near plane (z > -w) in clip space, then rasterise.
@@ -1126,7 +1335,7 @@ static void draw_prim(u32 op) {
 		for (int i = 0; i < count; i++) {
 			Vtx a = vs[i];
 			if (!f.through) to_screen(a);
-			Vtx b = a; b.sx += 1; b.sy += 1;
+			Vtx b = a; b.sx += g_render_scale; b.sy += g_render_scale;
 			draw_sprite(a, b);
 		}
 		break;
@@ -1269,6 +1478,10 @@ static void block_transfer() {
 	u32 dx = R[0xec] & 0x3FF, dy = (R[0xec] >> 10) & 0x3FF;
 	u32 w = (R[0xee] & 0x3FF) + 1, h = ((R[0xee] >> 10) & 0x3FF) + 1;
 	u32 bpp = (R[0xea] & 1) ? 4 : 2;
+	if (g_render_scale > 1) {
+		if (Shadow *sh = shadow_covering(src & 0x1FFFFFFF, sw * (sy + h) * bpp)) resolve_shadow(*sh);
+		if (Shadow *sh = shadow_covering(dst & 0x1FFFFFFF, dw * (dy + h) * bpp)) sh->vramNewer = true;
+	}
 	for (u32 y = 0; y < h; y++)
 		memmove(gptr(dst + ((dy + y) * dw + dx) * bpp), gptr(src + ((sy + y) * sw + sx) * bpp), w * bpp);
 }

@@ -7,6 +7,8 @@
 #include <string>
 
 #include "hle.h"
+#include <SDL2/SDL.h>
+#include <algorithm>
 
 Settings g_settings;
 
@@ -28,6 +30,10 @@ static bool apply_setting(const std::string &k, const std::string &v) {
 		int n = atoi(v.c_str());
 		if (n < 1) return false;
 		s.width = 480 * n; s.height = 272 * n;
+	} else if (k == "render_scale") {
+		int n = atoi(v.c_str());
+		if (n < 0 || n > 6) { fprintf(stderr, "render_scale must be 0 (auto) .. 6\n"); return false; }
+		s.renderScale = n;
 	} else if (k == "fullscreen") s.fullscreen = parse_bool(v);
 	else if (k == "filter") s.linear = v != "nearest";
 	else if (k == "vsync") s.vsync = parse_bool(v);
@@ -63,15 +69,26 @@ bool settings_parse_arg(int argc, char **argv, int &i) {
 	for (auto &ch : k) if (ch == '-') ch = '_';
 	if (k == "fullscreen" || k == "vsync" || k == "right_stick_dpad") return apply_setting(k, "1");
 	if (k == "windowed") { g_settings.fullscreen = false; return true; }
-	if (k == "fps" || k == "res" || k == "resolution" || k == "scale" || k == "filter" || k == "deadzone" || k == "pad_mapping") {
+	if (k == "fps" || k == "render_scale" || k == "res" || k == "resolution" || k == "scale" || k == "filter" || k == "deadzone" || k == "pad_mapping") {
 		if (i + 1 >= argc) return false;
 		return apply_setting(k, argv[++i]);
 	}
 	return false;
 }
 
+int settings_render_scale() {
+	if (g_settings.renderScale > 0) return g_settings.renderScale;
+	int h = g_settings.height;
+	if (g_settings.fullscreen) {
+		SDL_DisplayMode m;
+		if (SDL_GetDesktopDisplayMode(0, &m) == 0) h = m.h;
+	}
+	return std::max(1, std::min(6, (h + 136) / 272));   // nearest multiple of 272
+}
+
 const char *settings_usage() {
-	return "  --fps 30|60|120          game rate (30 = original; 60/120 raise the engine's tick, see NOTES.md)\n"
+	return "  --render-scale N         internal resolution 480x272 x N (default: match the window height, e.g. 1088 -> 4)\n"
+	       "  --fps 30|60|120          game rate (30 = original; 60/120 raise the engine's tick, see NOTES.md)\n"
 	       "  --res WxH | --scale N    window size (default 960x544); --fullscreen; --filter linear|nearest; --vsync\n"
 	       "  --deadzone N             gamepad stick deadzone 0..32767 (default 8000); --right-stick-dpad\n"
 	       "  settings may also be put in ssx.ini as key = value (fps, resolution, fullscreen, filter, vsync, deadzone)\n";

@@ -70,7 +70,15 @@ int kernel_new_uid() { return s_next_uid++; }
 
 int kernel_current_thread_id() { return s_cur ? s_cur->id : 0; }
 CPUState *kernel_current_ctx() { return s_cur ? &s_cur->ctx : currentMIPS; }
-void kernel_request_exit() { s_exit = true; }
+// Quit at once: the GE/raster/audio threads are detached and the game's
+// threads live on fibers, so an orderly unwind would only hang.
+void kernel_request_exit() {
+	s_exit = true;
+	rt_log(LOG_RT, "exit requested");
+	void platform_shutdown();
+	platform_shutdown();
+	_exit(0);
+}
 bool kernel_exit_requested() { return s_exit; }
 
 static Thread *get_thread(int id) {

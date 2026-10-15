@@ -6,6 +6,7 @@ struct Settings {
 	int fps = 30;              // 30 = original pacing, 60 / 120 = raised game rate (time-based engine)
 	int width = 960;           // window size (output resolution)
 	int height = 544;
+	int renderScale = 0;       // internal resolution = 480x272 * scale; 0 = match the window height
 	bool fullscreen = false;   // borderless desktop fullscreen
 	bool linear = true;        // scaling filter: linear (smooth) or nearest (sharp pixels)
 	bool vsync = false;        // host vsync on present
@@ -15,6 +16,7 @@ struct Settings {
 };
 
 extern Settings g_settings;
+int settings_render_scale();   // resolved scale (1..6)
 void settings_load(const char *path);
 // Returns false on an unknown option; i is advanced past consumed arguments.
 bool settings_parse_arg(int argc, char **argv, int &i);
