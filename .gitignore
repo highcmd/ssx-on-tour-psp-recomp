@@ -10,3 +10,8 @@ data/functions.json
 run/
 data/imports.txt
 .claude/
+extracted.part/
+*.iso.part
+ssx.ini
+*.log
+shot_*.ppm

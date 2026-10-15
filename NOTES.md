@@ -12,7 +12,7 @@ with a custom runtime (HLE kernel, GE→OpenGL, audio via SDL).
 - User has a real PSP with CFW (model/firmware: not yet asked).
 
 ## Input
-- `SSX - On Tour (USA) (En,Fr,De).zip` → `iso/` → `extracted/` (7z).
+- `tools/setup_from_iso.py` (via `./setup.sh <dump>`): zip → `iso/`, ISO 9660 → `extracted/`, verifies ULUS-10042 + BOOT.BIN SHA-1.
 - `extracted/PSP_GAME/SYSDIR/BOOT.BIN`: **unencrypted** ELF PRX (type 0xFFA0), module `ssxpsp` v1.1.
   EBOOT.BIN is the same program encrypted (~PSP) — ignore it.
 - No symbol table, but section names, full relocations, RTTI class names and source paths survive.
