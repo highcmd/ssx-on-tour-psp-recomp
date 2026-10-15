@@ -2,6 +2,8 @@
 // (0x04000000); every vblank we convert it to RGBA and present it.
 #include <SDL2/SDL.h>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "kernel.h"
 
@@ -101,9 +103,55 @@ void display_present() {
 	SDL_RenderPresent(s_ren);
 }
 
-static void update_buttons() {
-	const Uint8 *k = SDL_GetKeyboardState(nullptr);
+// Scripted input for headless testing: SSX_INPUT="16=start,20.5=cross+down,30=cross:1.0"
+// (time in seconds = buttons joined by '+', optional :duration, default 0.15 s)
+struct ScriptedPress { double t, dur; u32 buttons; };
+static std::vector<ScriptedPress> s_script;
+static void parse_script() {
+	static bool done;
+	if (done) return;
+	done = true;
+	const char *e = getenv("SSX_INPUT");
+	if (!e) return;
+	static const struct { const char *n; u32 b; } names[] = {
+		{"select", 0x1}, {"start", 0x8}, {"up", 0x10}, {"right", 0x20}, {"down", 0x40}, {"left", 0x80},
+		{"l", 0x100}, {"r", 0x200}, {"triangle", 0x1000}, {"circle", 0x2000}, {"cross", 0x4000}, {"square", 0x8000}};
+	std::string str = e;
+	size_t i = 0;
+	while (i < str.size()) {
+		size_t j = str.find(',', i);
+		if (j == std::string::npos) j = str.size();
+		std::string item = str.substr(i, j - i);
+		i = j + 1;
+		size_t eq = item.find('=');
+		if (eq == std::string::npos) continue;
+		ScriptedPress p{atof(item.c_str()), 0.15, 0};
+		std::string rest = item.substr(eq + 1);
+		size_t colon = rest.find(':');
+		if (colon != std::string::npos) { p.dur = atof(rest.c_str() + colon + 1); rest = rest.substr(0, colon); }
+		size_t k = 0;
+		while (k <= rest.size()) {
+			size_t plus = rest.find('+', k);
+			if (plus == std::string::npos) plus = rest.size();
+			std::string n = rest.substr(k, plus - k);
+			for (auto &nm : names) if (n == nm.n) p.buttons |= nm.b;
+			k = plus + 1;
+		}
+		s_script.push_back(p);
+	}
+}
+static u32 scripted_buttons() {
+	parse_script();
+	double now = rt_time_us() / 1e6;
 	u32 b = 0;
+	for (auto &p : s_script) if (now >= p.t && now < p.t + p.dur) b |= p.buttons;
+	return b;
+}
+
+static void update_buttons() {
+	if (s_headless) { s_buttons = scripted_buttons(); return; }
+	const Uint8 *k = SDL_GetKeyboardState(nullptr);
+	u32 b = scripted_buttons();
 	if (k[SDL_SCANCODE_UP]) b |= 0x10;
 	if (k[SDL_SCANCODE_RIGHT]) b |= 0x20;
 	if (k[SDL_SCANCODE_DOWN]) b |= 0x40;
@@ -148,7 +196,7 @@ static void update_buttons() {
 }
 
 void display_pump_events() {
-	if (s_headless) return;
+	if (s_headless) { update_buttons(); return; }
 	SDL_Event e;
 	while (SDL_PollEvent(&e)) {
 		if (e.type == SDL_QUIT) kernel_request_exit();
@@ -189,6 +237,10 @@ HLE(sceCtrl, sceCtrlSetSamplingMode) { RET(0); }
 HLE(sceCtrl, sceCtrlReadBufferPositive) {
 	u32 p = ARG(0);
 	int n = (int)ARG(1);
+	static int calls;
+	static u32 lastB = ~0u;
+	if (calls++ < 3 || s_buttons != lastB) rt_log(LOG_DISPLAY, "CtrlReadBufferPositive(%08x, %d) buttons %04x (call %d)", p, n, s_buttons, calls);
+	lastB = s_buttons;
 	for (int i = 0; i < n; i++) {
 		u32 q = p + i * 16;
 		SW(q, (u32)rt_time_us());
