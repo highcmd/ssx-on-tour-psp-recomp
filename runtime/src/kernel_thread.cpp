@@ -6,6 +6,9 @@
 #include <ucontext.h>
 #include <unistd.h>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -13,7 +16,8 @@
 
 #include "kernel.h"
 
-static const u32 VBLANK_US = 16683;
+static u32 VBLANK_US = 16683;   // 59.94 Hz; 120 Hz when the game runs above 60
+void kernel_set_vblank_hz(double hz) { VBLANK_US = (u32)(1e6 / hz); }
 
 struct Callback {
 	int id;
@@ -153,6 +157,7 @@ u32 kernel_wait(WaitType type, u32 id, u64 timeout_us, bool allowCallbacks, u32 
 		rt_log_error("kernel_wait(%d) outside of a thread (interrupt context?)", type);
 		return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
 	}
+	u64 waitStart = rt_time_us();
 	t->wait = type;
 	t->waitId = id;
 	t->waitDeadline = timeout_us ? rt_time_us() + timeout_us : 0;
@@ -174,6 +179,10 @@ u32 kernel_wait(WaitType type, u32 id, u64 timeout_us, bool allowCallbacks, u32 
 	}
 	t->wait = WAIT_NONE;
 	t->waitCB = false;
+	static double traceAt = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
+	u64 now = rt_time_us();
+	if (traceAt >= 0 && now / 1e6 >= traceAt && now - waitStart > 8000 && type != WAIT_VBLANK && type != WAIT_DELAY)
+		rt_log(LOG_THREAD, "long wait: '%s' type %d id %x %.1f ms ra=%08x", t->name.c_str(), type, id, (now - waitStart) / 1e3, t->ctx.r[31]);
 	return t->waitResult;
 }
 
@@ -204,13 +213,62 @@ void kernel_maybe_preempt() {
 	}
 }
 
+// Called after every HLE function: if a timer/interrupt is due (or the GE
+// posted something), let the scheduler run it now, as an interrupt would on
+// the PSP, instead of waiting until the current thread blocks.
+static u64 s_next_due = 0;
+static bool posted_pending();
+void kernel_poll_interrupts() {
+	if (!s_cur) return;
+	u64 now = rt_time_us();
+	if (now < s_next_due && !posted_pending()) return;
+	make_ready(s_cur);
+	s_cur->readySeq = 0;   // resumes first among equals, like after an interrupt
+	switch_to_scheduler();
+}
+
 void kernel_yield() {
 	if (!s_cur) return;
 	make_ready(s_cur);
 	switch_to_scheduler();
 }
 
+// Events posted from other host threads (the GE thread) run here, in order.
+static std::mutex s_post_mtx;
+static std::condition_variable s_post_cv;
+static std::vector<std::function<void()>> s_posted;
+
+void kernel_post_interrupt(std::function<void()> fn) {
+	{
+		std::lock_guard<std::mutex> lk(s_post_mtx);
+		s_posted.push_back(std::move(fn));
+	}
+	s_post_cv.notify_one();
+}
+
+static bool posted_pending() {
+	std::lock_guard<std::mutex> lk(s_post_mtx);
+	return !s_posted.empty();
+}
+
+static void run_posted() {
+	std::vector<std::function<void()>> todo;
+	{
+		std::lock_guard<std::mutex> lk(s_post_mtx);
+		todo.swap(s_posted);
+	}
+	for (auto &f : todo) f();
+}
+
+// Sleep until `us` passes or something is posted.
+static void idle_wait(u64 us) {
+	std::unique_lock<std::mutex> lk(s_post_mtx);
+	if (!s_posted.empty()) return;
+	s_post_cv.wait_for(lk, std::chrono::microseconds(us));
+}
+
 static void process_timers() {
+	run_posted();
 	u64 now = rt_time_us();
 	// thread wait timeouts
 	for (auto &[id, t] : s_threads) {
@@ -234,6 +292,8 @@ static void process_timers() {
 	}
 }
 
+static u64 next_deadline();
+static void update_next_due() { s_next_due = next_deadline(); }
 static u64 next_deadline() {
 	u64 d = ~0ull;
 	for (auto &[id, t] : s_threads)
@@ -394,6 +454,8 @@ void kernel_init() {
 	kernel_schedule(now + VBLANK_US, [now] { vblank_tick(now + VBLANK_US); });
 }
 
+static u64 s_idle_since;
+u64 g_prof_guest, g_prof_ge, g_prof_flush;
 void kernel_run() {
 	while (!s_exit) {
 		process_timers();
@@ -408,13 +470,24 @@ void kernel_run() {
 				kernel_dump_threads();
 				return;
 			}
-			if (d > now) usleep((useconds_t)std::min<u64>(d - now, 2000));
+			static u64 lastReport;
+			if (!s_idle_since) s_idle_since = now;
+			if (now - s_idle_since > 2000000 && now - lastReport > 2000000) {
+				lastReport = now;
+				rt_log(LOG_RT, "idle %.1fs: next deadline in %lld us, %zu timers", (now - s_idle_since) / 1e6, (long long)(d - now), s_timers.size());
+				kernel_dump_threads();
+			}
+			if (d > now) idle_wait(std::min<u64>(d - now, 2000));
 			continue;
 		}
+		s_idle_since = 0;
 		s_cur = t;
 		currentMIPS = &t->ctx;
 		t->status = Thread::RUNNING;
+		update_next_due();
+		u64 t0 = rt_time_us();
 		swapcontext(&s_sched_uc, &t->uc);
+		g_prof_guest += rt_time_us() - t0;
 		s_cur = nullptr;
 	}
 }
@@ -715,14 +788,21 @@ struct Alarm {
 };
 static std::map<int, Alarm> s_alarms;
 
-static void alarm_fire(int id) {
+static void alarm_fire(int id, u64 when) {
 	auto it = s_alarms.find(id);
 	if (it == s_alarms.end()) return;
+	static double traceAt = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
+	static int n;
+	u64 now0 = rt_time_us();
 	u32 next = kernel_call_interrupt(it->second.handler, it->second.common, 0, 0);
+	if (traceAt >= 0 && now0 / 1e6 >= traceAt && n++ < 30)
+		rt_log(LOG_THREAD, "alarm %d fired at %.2f ms (scheduled %.2f) -> next %u", id, now0 / 1e3, when / 1e3, next);
 	it = s_alarms.find(id);
 	if (it == s_alarms.end()) return;
 	if (next) {
-		it->second.timer = kernel_schedule(rt_time_us() + next, [id] { alarm_fire(id); });
+		// period counts from the scheduled time, not from when we got round to it
+		u64 at = std::max<u64>(when + next, rt_time_us() > when + 4 * (u64)next ? rt_time_us() : 0);
+		it->second.timer = kernel_schedule(at, [id, at] { alarm_fire(id, at); });
 	} else {
 		s_alarms.erase(it);
 	}
@@ -731,7 +811,9 @@ static void alarm_fire(int id) {
 HLE(ThreadManForUser, sceKernelSetAlarm) {
 	int id = kernel_new_uid();
 	s_alarms[id] = {ARG(1), ARG(2), 0};
-	s_alarms[id].timer = kernel_schedule(rt_time_us() + ARG(0), [id] { alarm_fire(id); });
+	u64 at = rt_time_us() + ARG(0);
+	s_alarms[id].timer = kernel_schedule(at, [id, at] { alarm_fire(id, at); });
+	LOGT("SetAlarm(%u us, handler %08x, common %08x) -> %d", ARG(0), ARG(1), ARG(2), id);
 	RET(id);
 }
 

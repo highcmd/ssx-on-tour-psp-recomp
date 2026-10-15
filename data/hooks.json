@@ -1,0 +1,4 @@
+{
+  "_comment": "Guest functions wrapped by runtime C++ hooks: generated F_<addr> calls hook(c, F_<addr>_orig). See runtime/src/game_hooks.cpp.",
+  "0x0886E774": "hook_SetGameRate"
+}

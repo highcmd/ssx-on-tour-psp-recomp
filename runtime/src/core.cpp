@@ -59,6 +59,8 @@ void rt_log_error(const char *fmt, ...) {
 	va_end(ap);
 }
 
+// Microseconds since start. Note: on this machine the TSC is not synchronised
+// across cores (the kernel uses HPET), so rdtsc cannot be used as a clock.
 u64 rt_time_us() {
 	static auto t0 = std::chrono::steady_clock::now();
 	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -182,14 +184,30 @@ static constexpr std::array<HLEFunc, sizeof...(Is)> make_tramps(std::integer_seq
 	return {unimpl_tramp<Is>...};
 }
 
+// Every implemented HLE call is wrapped so that pending interrupts get a chance
+// to run right after it (see kernel_poll_interrupts).
+void kernel_poll_interrupts();
+static HLEFunc s_real[256];
+template <int N>
+static void hle_wrap(CPUState *c) {
+	s_real[N](c);
+	kernel_poll_interrupts();
+}
+template <int... Is>
+static constexpr std::array<HLEFunc, sizeof...(Is)> make_wraps(std::integer_sequence<int, Is...>) {
+	return {hle_wrap<Is>...};
+}
+
 void hle_init_imports() {
+	static const auto wraps = make_wraps(std::make_integer_sequence<int, 256>{});
 	static const auto tramps = make_tramps(std::make_integer_sequence<int, 256>{});
 	int implemented = 0;
 	for (size_t i = 0; i < g_import_count; i++) {
 		const ImportEntry &e = g_import_list[i];
 		auto it = registry().find({e.lib, e.name});
 		if (it != registry().end()) {
-			g_imports[i] = it->second;
+			s_real[i] = it->second;
+			g_imports[i] = i < wraps.size() ? wraps[i] : it->second;
 			implemented++;
 		} else {
 			g_imports[i] = i < tramps.size() ? tramps[i] : tramps[0];

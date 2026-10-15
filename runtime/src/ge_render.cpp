@@ -3,8 +3,14 @@
 // Register semantics follow PPSSPP's GPU/ge_constants.h and its software
 // renderer (public, GPL); see NOTES.md.
 #include <algorithm>
+#include <array>
+#include <utility>
 #include <cmath>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <pthread.h>
 #include <unordered_map>
 #include <vector>
 
@@ -17,7 +23,7 @@ static int worldN, viewN, projN, tgenN, boneN;
 static float morphW[8];
 static u8 clut[1024];
 static u32 s_vaddr, s_iaddr;
-static u64 s_prims, s_pixels;
+static u64 s_prims;
 static int s_traceState;   // 0 idle, 1 armed (wait FINISH), 2 tracing, 3 done
 extern u32 g_ge_base, g_ge_offset;
 
@@ -25,7 +31,7 @@ static inline float f24(u32 v) { u32 b = v << 8; float f; memcpy(&f, &b, 4); ret
 static inline bool on(u32 cmd) { return R[cmd] & 1; }
 
 void ge_dump_stats() {
-	rt_log(LOG_GE, "GE: %llu prims, %llu pixels", (unsigned long long)s_prims, (unsigned long long)s_pixels);
+	rt_log(LOG_GE, "GE: %llu prims", (unsigned long long)s_prims);
 }
 u64 ge_prim_count() { return s_prims; }
 
@@ -362,7 +368,15 @@ static void decode_dxt(const TexInfo &t, std::vector<u32> &out) {
 		}
 }
 
+void ge_flush();
+static bool jobs_pending();
+static bool jobs_overlap(u32 addr, u32 size);
+static bool running_overlap(u32 addr, u32 size);
+extern u64 g_flush_why[8];
 static const u32 *get_texture(const TexInfo &t) {
+	// render-to-texture: draw pending pixels first if they target this texture's memory
+	if ((t.addr & 0x0F000000) == 0x04000000 &&
+	    (jobs_overlap(t.addr & 0x1FFFFFFF, 0x80000) || running_overlap(t.addr & 0x1FFFFFFF, 0x80000))) { g_flush_why[1]++; ge_flush(); }
 	int bits = s_bpp_bits[t.fmt];
 	bool isClut = t.fmt >= 4 && t.fmt <= 7;
 	u32 rowBytes = t.bufw * bits / 8;
@@ -372,6 +386,8 @@ static const u32 *get_texture(const TexInfo &t) {
 	u64 h = hash_bytes(gptr(t.addr), std::min<size_t>(bytes, 0x200000));
 	DecodedTex &d = s_texcache[key];
 	if (!d.px.empty() && d.hash == h && (!isClut || d.clutHash == s_clut_hash)) return d.px.data();
+	if (jobs_pending()) g_flush_why[2]++;
+	ge_flush();   // queued draws may still sample the old decode of this entry
 	d.px.assign((size_t)t.w * t.h, 0);
 	d.hash = h;
 	d.clutHash = s_clut_hash;
@@ -443,6 +459,7 @@ static Target current_target() {
 }
 
 // ============================================================ per-primitive pixel pipeline
+enum : unsigned { F_TEX = 1, F_LINEAR = 2, F_FOG = 4, F_ATEST = 8, F_ZTEST = 16, F_BLEND = 32, F_FB32 = 64, F_GENERIC = 0x80000000u };
 struct Pipe {
 	Target tgt;
 	int sx0, sy0, sx1, sy1;     // scissor (inclusive)
@@ -461,6 +478,7 @@ struct Pipe {
 	u32 texEnv;
 	bool gouraud;
 	int minZ, maxZ;
+	unsigned spec;   // specialisation key (see shade_t), GENERIC for clear/stencil
 };
 static Pipe P;
 
@@ -521,12 +539,14 @@ static void setup_pipe(bool through) {
 		p.writeMask = (R[0xe8] & 0xFFFFFF) | ((R[0xe9] & 255) << 24);
 	}
 	p.minZ = R[0xd6] & 0xFFFF; p.maxZ = R[0xd7] & 0xFFFF;
+	if (p.clear || p.stencil) p.spec = F_GENERIC;
+	else p.spec = (p.tex ? F_TEX : 0) | (p.tex && p.texLinear ? F_LINEAR : 0) | (p.fog ? F_FOG : 0) | (p.alphaTest ? F_ATEST : 0) |
+	              (p.depthTest ? F_ZTEST : 0) | (p.blend ? F_BLEND : 0) | (p.tgt.fmt == 3 ? F_FB32 : 0);
 }
 
 static inline int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-static inline u32 sample(float s, float t) {
-	const Pipe &p = P;
+static inline u32 sample(const Pipe &p, float s, float t) {
 	auto fetch = [&](int x, int y) -> u32 {
 		if (p.texClampU) x = std::clamp(x, 0, (int)p.tw - 1); else x &= p.tw - 1;
 		if (p.texClampV) y = std::clamp(y, 0, (int)p.th - 1); else y &= p.th - 1;
@@ -564,9 +584,51 @@ static inline int blend_factor(int f, bool src, int sa, int da, int sc, int dc, 
 }
 
 // Shade one pixel. r,g,b,a: 0..255 primitive color; z: 0..65535; s,t: texcoord.
-static inline void shade(int x, int y, float r, float g, float b, float a, float z, float s, float t, float fog) {
-	Pipe &p = P;
-	s_pixels++;
+// A pipeline flag: known at compile time in specialised variants, read at run time in the generic one.
+#define SPEC(field, bit) ((F & F_GENERIC) ? (field) : ((F & (bit)) != 0))
+
+template <bool LINEAR>
+static inline u32 sample_t(const Pipe &p, float s, float t) {
+	int mu = p.tw - 1, mv = p.th - 1;
+	auto fetch = [&](int x, int y) -> u32 {
+		x = p.texClampU ? std::clamp(x, 0, mu) : (x & mu);
+		y = p.texClampV ? std::clamp(y, 0, mv) : (y & mv);
+		return p.texels[y * p.tw + x];
+	};
+	float fu = s * p.tw, fv = t * p.th;
+	if (!LINEAR) return fetch((int)floorf(fu), (int)floorf(fv));
+	fu -= 0.5f; fv -= 0.5f;
+	int x0 = (int)floorf(fu), y0 = (int)floorf(fv);
+	int fx = (int)((fu - x0) * 256), fy = (int)((fv - y0) * 256);
+	u32 c00 = fetch(x0, y0), c10 = fetch(x0 + 1, y0), c01 = fetch(x0, y0 + 1), c11 = fetch(x0 + 1, y0 + 1);
+	u32 out = 0;
+	for (int sh = 0; sh < 32; sh += 8) {
+		int a = (c00 >> sh) & 255, b = (c10 >> sh) & 255, c = (c01 >> sh) & 255, d = (c11 >> sh) & 255;
+		int top = a * (256 - fx) + b * fx, bot = c * (256 - fx) + d * fx;
+		out |= (u32)((top * (256 - fy) + bot * fy) >> 16) << sh;
+	}
+	return out;
+}
+
+template <unsigned F>
+static inline u32 fb_read_t(const Target &t, int x, int y) {
+	if (!(F & F_GENERIC) && (F & F_FB32)) { u32 v; memcpy(&v, t.fb + (y * t.stride + x) * 4, 4); return v; }
+	return fb_read(t, x, y);
+}
+template <unsigned F>
+static inline void fb_write_t(const Target &t, int x, int y, u32 c, u32 mask) {
+	if (!(F & F_GENERIC) && (F & F_FB32)) {
+		u32 *q = (u32 *)(t.fb + (y * t.stride + x) * 4);
+		*q = mask ? ((*q & mask) | (c & ~mask)) : c;
+		return;
+	}
+	fb_write(t, x, y, c, mask);
+}
+
+static thread_local u64 t_pixels;
+template <unsigned F>
+static inline void shade_t(const Pipe &p, int x, int y, float r, float g, float b, float a, float z, float s, float t, float fog) {
+	t_pixels++;
 	int iz = (int)z;
 	if (!p.through && !p.clear && (iz < p.minZ || iz > p.maxZ)) return;
 	iz = std::clamp(iz, 0, 65535);
@@ -578,8 +640,8 @@ static inline void shade(int x, int y, float r, float g, float b, float a, float
 		if (p.clearDepth) *zp = (u16)iz;
 		return;
 	}
-	if (p.tex) {
-		u32 tc = sample(s, t);
+	if (SPEC(p.tex, F_TEX)) {
+		u32 tc = (F & F_GENERIC) ? sample(p, s, t) : sample_t<(F & F_LINEAR) != 0>(p, s, t);
 		int tr = tc & 255, tg = (tc >> 8) & 255, tb = (tc >> 16) & 255, ta = tc >> 24;
 		int dbl = p.colorDouble ? 2 : 1;
 		switch (p.texFunc) {
@@ -613,21 +675,21 @@ static inline void shade(int x, int y, float r, float g, float b, float a, float
 		}
 		cr = clamp255(cr); cg = clamp255(cg); cb = clamp255(cb); ca = clamp255(ca);
 	}
-	if (p.fog) {
+	if (SPEC(p.fog, F_FOG)) {
 		int f = (int)(fog * 255);
 		cr = (cr * f + (int)(p.fogColor & 255) * (255 - f) + 255) / 256;
 		cg = (cg * f + (int)((p.fogColor >> 8) & 255) * (255 - f) + 255) / 256;
 		cb = (cb * f + (int)((p.fogColor >> 16) & 255) * (255 - f) + 255) / 256;
 	}
-	if (p.alphaTest && !cmp(p.atFunc, (u32)ca & p.atMask, p.atRef & p.atMask)) return;
-	u32 dst = fb_read(p.tgt, x, y);
+	if (SPEC(p.alphaTest, F_ATEST) && !cmp(p.atFunc, (u32)ca & p.atMask, p.atRef & p.atMask)) return;
+	u32 dst = (SPEC(p.blend, F_BLEND) || p.stencil) ? fb_read_t<F>(p.tgt, x, y) : 0;
 	if (p.stencil) {
 		u32 ds = dst >> 24;
 		if (!cmp(p.stFunc, p.stRef & p.stMask, ds & p.stMask)) return;
 	}
-	if (p.depthTest && !cmp(p.zFunc, (u32)iz, *zp)) return;
+	if (SPEC(p.depthTest, F_ZTEST) && !cmp(p.zFunc, (u32)iz, *zp)) return;
 	if (p.zWrite) *zp = (u16)iz;
-	if (p.blend) {
+	if (SPEC(p.blend, F_BLEND)) {
 		int dr = dst & 255, dg = (dst >> 8) & 255, db = (dst >> 16) & 255, da = dst >> 24;
 		int sc[3] = {cr, cg, cb}, dc[3] = {dr, dg, db}, out[3];
 		for (int k = 0; k < 3; k++) {
@@ -656,30 +718,51 @@ static inline void shade(int x, int y, float r, float g, float b, float a, float
 		}
 	}
 	u32 c = (u32)cr | ((u32)cg << 8) | ((u32)cb << 16) | (outA << 24);
-	fb_write(p.tgt, x, y, c, p.writeMask);
+	fb_write_t<F>(p.tgt, x, y, c, p.writeMask);
 }
 
 // ============================================================ rasterisation
-static void draw_sprite(const Vtx &a, const Vtx &b) {
+// Each worker rasterises only the rows of its bands, so per-pixel order is kept.
+static const int BAND_SHIFT = 3;
+static inline bool my_row(int y, int tid, int n) { return ((y >> BAND_SHIFT) % n) == tid; }
+// Does [y0, y1] contain any row of this worker's bands?
+static inline bool my_rows(int y0, int y1, int tid, int n) {
+	if (n == 1) return true;
+	int b0 = y0 >> BAND_SHIFT, b1 = y1 >> BAND_SHIFT;
+	if (b1 - b0 + 1 >= n) return true;
+	for (int b = b0; b <= b1; b++) if (b % n == tid) return true;
+	return false;
+}
+
+template <unsigned F>
+static void raster_sprite_t(const Pipe &P, const Vtx &a, const Vtx &b, int tid, int nth) {
 	float x0 = a.sx, y0 = a.sy, x1 = b.sx, y1 = b.sy;
 	float u0 = a.u, v0 = a.v, u1 = b.u, v1 = b.v;
 	if (x0 > x1) { std::swap(x0, x1); std::swap(u0, u1); }
 	if (y0 > y1) { std::swap(y0, y1); std::swap(v0, v1); }
 	int ix0 = std::max((int)ceilf(x0 - 0.5f), P.sx0), ix1 = std::min((int)ceilf(x1 - 0.5f) - 1, P.sx1);
 	int iy0 = std::max((int)ceilf(y0 - 0.5f), P.sy0), iy1 = std::min((int)ceilf(y1 - 0.5f) - 1, P.sy1);
+	if (iy0 > iy1 || !my_rows(iy0, iy1, tid, nth)) return;
 	float du = x1 > x0 ? (u1 - u0) / (x1 - x0) : 0, dv = y1 > y0 ? (v1 - v0) / (y1 - y0) : 0;
 	float sw = P.through ? 1.0f / P.tw : 1.0f, shh = P.through ? 1.0f / P.th : 1.0f;
 	if (!P.tex) sw = shh = 0;
 	for (int y = iy0; y <= iy1; y++) {
+		if (!my_row(y, tid, nth)) continue;
 		float vv = v0 + (y + 0.5f - y0) * dv;
 		for (int x = ix0; x <= ix1; x++) {
 			float uu = u0 + (x + 0.5f - x0) * du;
-			shade(x, y, b.r, b.g, b.b, b.a, b.sz, uu * sw, vv * shh, b.fog);
+			shade_t<F>(P, x, y, b.r, b.g, b.b, b.a, b.sz, uu * sw, vv * shh, b.fog);
 		}
 	}
 }
 
-static void draw_triangle(const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx &flat) {
+template <unsigned F>
+static void raster_triangle_t(const Pipe &P, const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx &flat, int tid, int nth) {
+	{
+		int qy0 = std::max((int)floorf(std::min({v0.sy, v1.sy, v2.sy})), P.sy0);
+		int qy1 = std::min((int)ceilf(std::max({v0.sy, v1.sy, v2.sy})), P.sy1);
+		if (qy0 > qy1 || !my_rows(qy0, qy1, tid, nth)) return;
+	}
 	float area = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v2.sx - v0.sx) * (v1.sy - v0.sy);
 	if (area == 0) return;
 	int minx = std::max((int)floorf(std::min({v0.sx, v1.sx, v2.sx})), P.sx0);
@@ -688,11 +771,9 @@ static void draw_triangle(const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx
 	int maxy = std::min((int)ceilf(std::max({v0.sy, v1.sy, v2.sy})), P.sy1);
 	if (minx > maxx || miny > maxy) return;
 	float ia = 1.0f / area;
-	// perspective: interpolate attr/w and 1/w
 	float w0 = P.through ? 1 : 1 / v0.w, w1 = P.through ? 1 : 1 / v1.w, w2 = P.through ? 1 : 1 / v2.w;
 	float sw = P.through && P.tex ? 1.0f / P.tw : 1.0f, shh = P.through && P.tex ? 1.0f / P.th : 1.0f;
 	bool g = P.gouraud;
-	// top-left fill rule
 	auto edge_bias = [](const Vtx &a, const Vtx &b, float sign) {
 		float dy = b.sy - a.sy, dx = b.sx - a.sx;
 		bool topLeft = (dy * sign < 0) || (dy == 0 && dx * sign > 0);
@@ -700,12 +781,14 @@ static void draw_triangle(const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx
 	};
 	float sgn = area > 0 ? 1.0f : -1.0f;
 	float b0 = edge_bias(v1, v2, sgn), b1 = edge_bias(v2, v0, sgn), b2 = edge_bias(v0, v1, sgn);
+	// edge functions are affine in x: e(x+1) = e(x) + dE
+	float d0 = -(v2.sy - v1.sy) * ia, d1 = -(v0.sy - v2.sy) * ia;
 	for (int y = miny; y <= maxy; y++) {
-		float py = y + 0.5f;
-		for (int x = minx; x <= maxx; x++) {
-			float px = x + 0.5f;
-			float e0 = ((v2.sx - v1.sx) * (py - v1.sy) - (v2.sy - v1.sy) * (px - v1.sx)) * ia;
-			float e1 = ((v0.sx - v2.sx) * (py - v2.sy) - (v0.sy - v2.sy) * (px - v2.sx)) * ia;
+		if (!my_row(y, tid, nth)) continue;
+		float py = y + 0.5f, px = minx + 0.5f;
+		float e0 = ((v2.sx - v1.sx) * (py - v1.sy) - (v2.sy - v1.sy) * (px - v1.sx)) * ia;
+		float e1 = ((v0.sx - v2.sx) * (py - v2.sy) - (v0.sy - v2.sy) * (px - v2.sx)) * ia;
+		for (int x = minx; x <= maxx; x++, e0 += d0, e1 += d1) {
 			float e2 = 1.0f - e0 - e1;
 			if (e0 < b0 || e1 < b1 || e2 < b2) continue;
 			float z = e0 * v0.sz + e1 * v1.sz + e2 * v2.sz;
@@ -715,16 +798,189 @@ static void draw_triangle(const Vtx &v0, const Vtx &v1, const Vtx &v2, const Vtx
 			float t = (q0 * v0.v + q1 * v1.v + q2 * v2.v) * qi * shh;
 			float fog = e0 * v0.fog + e1 * v1.fog + e2 * v2.fog;
 			if (g)
-				shade(x, y, e0 * v0.r + e1 * v1.r + e2 * v2.r, e0 * v0.g + e1 * v1.g + e2 * v2.g,
+				shade_t<F>(P, x, y, e0 * v0.r + e1 * v1.r + e2 * v2.r, e0 * v0.g + e1 * v1.g + e2 * v2.g,
 				      e0 * v0.b + e1 * v1.b + e2 * v2.b, e0 * v0.a + e1 * v1.a + e2 * v2.a, z, s, t, fog);
 			else
-				shade(x, y, flat.r, flat.g, flat.b, flat.a, z, s, t, fog);
+				shade_t<F>(P, x, y, flat.r, flat.g, flat.b, flat.a, z, s, t, fog);
 		}
 	}
 }
 
+typedef void (*TriFn)(const Pipe &, const Vtx &, const Vtx &, const Vtx &, const Vtx &, int, int);
+typedef void (*SprFn)(const Pipe &, const Vtx &, const Vtx &, int, int);
+template <unsigned... Ks>
+static constexpr std::array<TriFn, sizeof...(Ks)> make_tri(std::integer_sequence<unsigned, Ks...>) { return {raster_triangle_t<Ks>...}; }
+template <unsigned... Ks>
+static constexpr std::array<SprFn, sizeof...(Ks)> make_spr(std::integer_sequence<unsigned, Ks...>) { return {raster_sprite_t<Ks>...}; }
+static const auto s_triFns = make_tri(std::make_integer_sequence<unsigned, 128>{});
+static const auto s_sprFns = make_spr(std::make_integer_sequence<unsigned, 128>{});
+
+static inline void raster_triangle(const Pipe &p, const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &f, int tid, int nth) {
+	if (p.spec == F_GENERIC) raster_triangle_t<F_GENERIC>(p, a, b, c, f, tid, nth);
+	else s_triFns[p.spec](p, a, b, c, f, tid, nth);
+}
+static inline void raster_sprite(const Pipe &p, const Vtx &a, const Vtx &b, int tid, int nth) {
+	if (p.spec == F_GENERIC) raster_sprite_t<F_GENERIC>(p, a, b, tid, nth);
+	else s_sprFns[p.spec](p, a, b, tid, nth);
+}
+
+// ============================================================ deferred, multi-threaded drawing
+struct Job {
+	u32 pipe;
+	u8 kind;   // 0 triangle, 1 sprite
+	Vtx v[4];  // tri: v0 v1 v2 flat; sprite: a b
+};
+static std::vector<Job> s_jobs = [] { std::vector<Job> v; v.reserve(65536); return v; }();
+static std::vector<Pipe> s_pipes;
+static bool jobs_pending() { return !s_jobs.empty(); }
+struct Range { u32 lo, hi; };
+static std::vector<Range> s_dirty;   // guest memory written by queued jobs (colour + depth)
+static bool jobs_overlap(u32 addr, u32 size) {
+	if (s_jobs.empty()) return false;
+	for (const Range &r : s_dirty)
+		if (addr < r.hi && r.lo < addr + size) return true;
+	return false;
+}
+static void note_target(const Pipe &p) {
+	u32 fb = (u32)(p.tgt.fb - g_mem), zb = (u32)((u8 *)p.tgt.zb - g_mem);
+	u32 rows = (u32)p.sy1 + 1;
+	Range a{fb, fb + p.tgt.stride * rows * (p.tgt.fmt == 3 ? 4 : 2)}, b{zb, zb + p.tgt.zstride * rows * 2};
+	for (const Range &r : {a, b}) {
+		bool known = false;
+		for (const Range &d : s_dirty) if (d.lo == r.lo && d.hi == r.hi) known = true;
+		if (!known) s_dirty.push_back(r);
+	}
+}
+static int s_pipe_cur = -1;      // index of P in s_pipes for the current prim
+
+static std::vector<std::thread> s_workers;
+static std::mutex s_mtx;
+static std::condition_variable s_cv_start, s_cv_done;
+static u64 s_gen;
+static int s_pending;
+static int s_nthreads = 0;
+// Batch being rasterised by the workers while the GE thread builds the next one.
+static std::vector<Job> s_run_jobs;
+static std::vector<Pipe> s_run_pipes;
+static std::vector<Range> s_run_dirty;
+
+static void run_jobs(int tid) {
+	for (const Job &j : s_run_jobs) {
+		const Pipe &p = s_run_pipes[j.pipe];
+		if (j.kind == 0) raster_triangle(p, j.v[0], j.v[1], j.v[2], j.v[3], tid, s_nthreads);
+		else raster_sprite(p, j.v[0], j.v[1], tid, s_nthreads);
+	}
+}
+
+static void worker_main(int tid) {
+	char nm[16];
+	snprintf(nm, sizeof(nm), "raster%d", tid);
+	pthread_setname_np(pthread_self(), nm);
+	u64 seen = 0;
+	while (true) {
+		{
+			std::unique_lock<std::mutex> lk(s_mtx);
+			s_cv_start.wait(lk, [&] { return s_gen != seen; });
+			seen = s_gen;
+		}
+		run_jobs(tid);
+		{
+			std::lock_guard<std::mutex> lk(s_mtx);
+			if (--s_pending == 0) s_cv_done.notify_all();
+		}
+	}
+}
+
+static void ge_wait_running() {
+	std::unique_lock<std::mutex> lk(s_mtx);
+	s_cv_done.wait(lk, [] { return s_pending == 0; });
+}
+
+static bool running_overlap(u32 addr, u32 size) {
+	{
+		std::lock_guard<std::mutex> lk(s_mtx);
+		if (s_pending == 0) return false;
+	}
+	for (const Range &r : s_run_dirty)
+		if (addr < r.hi && r.lo < addr + size) return true;
+	return false;
+}
+
+u64 g_ge_flushes, g_ge_jobs;
+u64 g_flush_why[8];
+
+// Hand the current batch to the raster workers and return (they run while we build the next).
+void ge_submit() {
+	if (s_jobs.empty()) { s_pipes.clear(); s_dirty.clear(); s_pipe_cur = -1; return; }
+	if (s_nthreads == 0) {
+		const char *e = getenv("SSX_GE_THREADS");
+		int n = e ? atoi(e) : (int)std::min(15u, std::max(2u, std::thread::hardware_concurrency() - 1));
+		s_nthreads = std::max(1, n);
+		for (int i = 0; i < s_nthreads; i++) std::thread(worker_main, i).detach();
+	}
+	g_ge_flushes++;
+	g_ge_jobs += s_jobs.size();
+	ge_wait_running();
+	s_run_jobs.swap(s_jobs);
+	s_run_pipes.swap(s_pipes);
+	s_run_dirty.swap(s_dirty);
+	s_jobs.clear();
+	s_pipes.clear();
+	s_dirty.clear();
+	s_pipe_cur = -1;
+	{
+		std::lock_guard<std::mutex> lk(s_mtx);
+		s_pending = s_nthreads;
+		s_gen++;
+	}
+	s_cv_start.notify_all();
+}
+
+// Full sync: everything queued so far is in guest memory when this returns.
+void ge_flush() {
+	extern u64 g_prof_flush;
+	u64 t0 = rt_time_us();
+	ge_submit();
+	ge_wait_running();
+	g_prof_flush += rt_time_us() - t0;
+}
+
+static void emit_triangle(const Vtx &a, const Vtx &b, const Vtx &c, const Vtx &flat) {
+	if (s_pipe_cur < 0) { s_pipes.push_back(P); s_pipe_cur = (int)s_pipes.size() - 1; note_target(P); }
+	Job j;
+	j.pipe = s_pipe_cur;
+	j.kind = 0;
+	j.v[0] = a; j.v[1] = b; j.v[2] = c; j.v[3] = flat;
+	s_jobs.push_back(j);
+	if (s_jobs.size() >= 4096) ge_submit();
+}
+
+static void draw_sprite(const Vtx &a, const Vtx &b) {
+	if (s_pipe_cur < 0) { s_pipes.push_back(P); s_pipe_cur = (int)s_pipes.size() - 1; note_target(P); }
+	Job j;
+	j.pipe = s_pipe_cur;
+	j.kind = 1;
+	j.v[0] = a; j.v[1] = b;
+	s_jobs.push_back(j);
+}
+
 // Clip a triangle against the near plane (z > -w) in clip space, then rasterise.
-static void clip_and_draw(Vtx a, Vtx b, Vtx c, bool cullOn, int cullCCW) {
+static void clip_and_draw_slow(Vtx a, Vtx b, Vtx c, bool cullOn, int cullCCW);
+static inline void clip_and_draw(const Vtx &a, const Vtx &b, const Vtx &c, bool cullOn, int cullCCW) {
+	if (P.through) { emit_triangle(a, b, c, c); return; }
+	if (a.z + a.w < 0 || b.z + b.w < 0 || c.z + c.w < 0) { clip_and_draw_slow(a, b, c, cullOn, cullCCW); return; }
+	// screen positions were computed once per vertex in draw_prim
+	if (cullOn) {
+		float area = (b.sx - a.sx) * (c.sy - a.sy) - (c.sx - a.sx) * (b.sy - a.sy);
+		if (cullCCW ? area < 0 : area > 0) return;
+	}
+	// trivially outside the scissor?
+	if (std::max({a.sx, b.sx, c.sx}) < P.sx0 || std::min({a.sx, b.sx, c.sx}) > P.sx1 + 1 ||
+	    std::max({a.sy, b.sy, c.sy}) < P.sy0 || std::min({a.sy, b.sy, c.sy}) > P.sy1 + 1) return;
+	emit_triangle(a, b, c, c);
+}
+
+static void clip_and_draw_slow(Vtx a, Vtx b, Vtx c, bool cullOn, int cullCCW) {
 	auto lerp = [](const Vtx &p, const Vtx &q, float t) {
 		Vtx r;
 		r.x = p.x + (q.x - p.x) * t; r.y = p.y + (q.y - p.y) * t; r.z = p.z + (q.z - p.z) * t; r.w = p.w + (q.w - p.w) * t;
@@ -751,7 +1007,7 @@ static void clip_and_draw(Vtx a, Vtx b, Vtx c, bool cullOn, int cullCCW) {
 			if (cullCCW ? area < 0 : area > 0) return;
 		}
 	}
-	for (int i = 1; i + 1 < n; i++) draw_triangle(in[0], in[i], in[i + 1], c);
+	for (int i = 1; i + 1 < n; i++) emit_triangle(in[0], in[i], in[i + 1], c);
 }
 
 static void draw_prim(u32 op) {
@@ -760,22 +1016,40 @@ static void draw_prim(u32 op) {
 	u32 vt = R[0x12];
 	VFormat f = decode_vtype(vt);
 	setup_pipe(f.through);
+	s_pipe_cur = -1;
 	s_prims++;
-	std::vector<Vtx> vs(count);
+	static std::vector<Vtx> vs;
+	vs.resize(count);
 	int idxSize = f.idx == 1 ? 1 : f.idx == 2 ? 2 : f.idx == 3 ? 4 : 0;
-	for (int i = 0; i < count; i++) {
-		u32 index = i;
-		if (idxSize == 1) index = LB(s_iaddr + i);
-		else if (idxSize == 2) index = LH(s_iaddr + 2 * i);
-		else if (idxSize == 4) index = LW(s_iaddr + 4 * i);
-		vs[i] = transform_vertex(f, gptr(s_vaddr + index * f.size * f.nm));
+	if (!idxSize) {
+		for (int i = 0; i < count; i++) vs[i] = transform_vertex(f, gptr(s_vaddr + i * f.size * f.nm));
+	} else {
+		// indexed strips reuse vertices: transform each distinct index once
+		static std::vector<u32> stamp;
+		static std::vector<Vtx> cache;
+		static u32 gen;
+		if (++gen == 0) { std::fill(stamp.begin(), stamp.end(), 0); gen = 1; }
+		for (int i = 0; i < count; i++) {
+			u32 index = idxSize == 1 ? LB(s_iaddr + i) : idxSize == 2 ? LH(s_iaddr + 2 * i) : LW(s_iaddr + 4 * i);
+			if (index < 65536) {
+				if (index >= stamp.size()) { stamp.resize(index + 1, 0); cache.resize(index + 1); }
+				if (stamp[index] != gen) { cache[index] = transform_vertex(f, gptr(s_vaddr + index * f.size * f.nm)); stamp[index] = gen; }
+				vs[i] = cache[index];
+			} else {
+				vs[i] = transform_vertex(f, gptr(s_vaddr + index * f.size * f.nm));
+			}
+		}
 	}
+	if (!f.through)
+		for (int i = 0; i < count; i++)
+			if (vs[i].z + vs[i].w >= 0) to_screen(vs[i]);
 	if (idxSize) s_iaddr += count * idxSize;
 	else s_vaddr += count * f.size * f.nm;
 
 	static double traceAt = getenv("SSX_GETRACE_AT") ? atof(getenv("SSX_GETRACE_AT")) : -1;
 	if (traceAt >= 0 && s_traceState == 0 && rt_time_us() / 1e6 >= traceAt) s_traceState = 1;
-	u64 px0 = s_pixels;
+	if (s_traceState == 2) ge_flush();
+	u64 px0 = t_pixels;
 	static int dbg = getenv("SSX_GEDEBUG") ? atoi(getenv("SSX_GEDEBUG")) : 0;
 	if (dbg > 0) {
 		dbg--;
@@ -818,18 +1092,22 @@ static void draw_prim(u32 op) {
 		break;
 	}
 	if (s_traceState == 2) {
+		ge_flush();
 		Vtx a = vs[0];
 		if (!f.through) to_screen(a);
 		if (P.clear || type == 4) rt_log(LOG_GE, "T   viewport z: scale %f pos %f  minz %u maxz %u  zbuf %p clearDepth %d v0.sz %.1f",
 		       f24(R[0x44]), f24(R[0x47]), R[0xd6] & 0xFFFF, R[0xd7] & 0xFFFF, (void *)P.tgt.zb, P.clearDepth, a.sz);
 		rt_log(LOG_GE, "T prim %d n %3d vt %06x thr %d tex %d fmt %u %ux%u zt %d/%d zw %d blend %d at %d cull %d tmap %u px %llu | v0 clip(%.1f %.1f %.1f %.1f) scr(%.0f %.0f %.0f) a %.0f",
 		       type, count, vt, f.through, P.tex, R[0xc3] & 15, P.tw, P.th, P.depthTest, P.zFunc, P.zWrite, P.blend, P.alphaTest, cullOn ? 1 + cullCCW : 0,
-		       R[0xc0] & 3, (unsigned long long)(s_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a);
+		       R[0xc0] & 3, (unsigned long long)(t_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a);
 	}
 }
 
 // ============================================================ block transfer (TRXKICK)
+void ge_flush();
 static void block_transfer() {
+	if (!s_jobs.empty()) g_flush_why[3]++;
+	ge_flush();
 	u32 src = (R[0xb2] & 0xFFFFF0) | ((R[0xb3] & 0xFF0000) << 8);
 	u32 dst = (R[0xb4] & 0xFFFFF0) | ((R[0xb5] & 0xFF0000) << 8);
 	u32 sw = R[0xb3] & 0xFFFF, dw = R[0xb5] & 0xFFFF;
@@ -849,7 +1127,7 @@ void ge_exec_cmd(u32 cmd, u32 op, u32 pc) {
 	switch (cmd) {
 	case 0x01: s_vaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
 	case 0x02: s_iaddr = ((g_ge_base & 0x0F000000) | data) + g_ge_offset; break;
-	case 0x04: draw_prim(data); break;
+	case 0x04: { extern u64 g_prof_ge; u64 t0 = rt_time_us(); draw_prim(data); g_prof_ge += rt_time_us() - t0; break; }
 	case 0x2a: boneN = data; break;
 	case 0x2b: if (boneN < 96) boneM[boneN / 12][boneN % 12] = f24(data); boneN++; break;
 	case 0x2c: case 0x2d: case 0x2e: case 0x2f: case 0x30: case 0x31: case 0x32: case 0x33:

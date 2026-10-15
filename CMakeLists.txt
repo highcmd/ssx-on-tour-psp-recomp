@@ -45,7 +45,9 @@ add_executable(ssx
   runtime/src/hle_ge.cpp
   runtime/src/ge_render.cpp
   runtime/src/hle_misc.cpp
-  runtime/src/hle_mpeg.cpp)
+  runtime/src/hle_mpeg.cpp
+  runtime/src/settings.cpp
+  runtime/src/game_hooks.cpp)
 target_include_directories(ssx PRIVATE runtime/src runtime/vfpu/shim ${GEN_DIR})
 target_compile_options(ssx PRIVATE -Wall -Wno-unused-function -fno-strict-aliasing -fwrapv)
 set_source_files_properties(runtime/src/ge_render.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
