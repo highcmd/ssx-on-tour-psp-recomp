@@ -1,0 +1,156 @@
+# Options and configuration
+
+You can set options in two places:
+
+1. **`run/ssx.ini`**: the configuration file, read from the directory the game starts in. `run.sh`
+   always starts it in `run/`. Copy [`ssx.ini.example`](../ssx.ini.example) there to begin.
+2. **Command-line flags**: `./run.sh --fps 60 --fullscreen`. A flag overrides the same key in the file.
+
+In `ssx.ini`, write `key = value`, one per line; `#` starts a comment. On the command line, use
+`--key value`; dashes and underscores are interchangeable (`--render-scale` = `--render_scale`).
+`./run.sh --help` prints a short summary.
+
+## Settings
+
+| `ssx.ini` key | Flag | Values | Default | What it does |
+|---|---|---|---|---|
+| `fps` | `--fps N` | `30`, `60`, `120` | `30` | game frame rate, see [Frame rate](#frame-rate) |
+| `resolution` (or `res`) | `--res WxH` | e.g. `1920x1080` | `960x544` | window size |
+| `scale` | `--scale N` | `1`, `2`, … | none | shorthand for a window of 480·N × 272·N |
+| `fullscreen` | `--fullscreen` / `--windowed` | `true`/`false` | `false` | borderless fullscreen at the desktop resolution; F11 toggles it while playing |
+| `renderer` | `--renderer R` | `gl`, `software` | `gl` | `gl` = GPU (OpenGL 3.3); `software` = CPU reference renderer |
+| `render_scale` | `--render-scale N` | `0`–`6` | `0` (auto) | internal resolution, see [Resolution](#resolution) |
+| `filter` | `--filter F` | `linear`, `nearest` | `linear` | filter used to fit the picture into the window |
+| `vsync` | `--vsync` | `true`/`false` | `false` | sync presentation to the monitor refresh rate |
+| `deadzone` | `--deadzone N` | `0`–`32767` | `8000` | left-stick deadzone; raise it if the rider drifts |
+| `right_stick_dpad` | `--right-stick-dpad` | `true`/`false` | `false` | the right stick also works as the D-pad (menus) |
+| `pad_mapping` | `--pad-mapping STR` | SDL mapping line | none | adds a mapping for a pad SDL doesn't know, see [Gamepads](#gamepads) |
+
+In `ssx.ini`, booleans accept `true`/`1`/`on`/`yes`; anything else counts as false.
+
+Example `run/ssx.ini` for a 1080p monitor:
+
+```ini
+fps = 60
+resolution = 1920x1080
+fullscreen = true
+render_scale = 0      # auto -> 4 (1088 px of internal height)
+filter = linear
+vsync = true
+```
+
+### Resolution
+
+The PSP renders at 480×272. The game is drawn at **480·N × 272·N** on the GPU (`render_scale = N`).
+This is real rendering at the higher resolution, with sharp edges and detailed distant geometry, not a
+stretched 480×272 image. The finished frame is then fitted into the window with its 480:272 aspect
+ratio kept (letterboxed when needed) and filtered with `filter`.
+
+| `render_scale` | Internal resolution | Good for |
+|---|---|---|
+| 1 | 480×272 | original look |
+| 2 | 960×544 | |
+| 3 | 1440×816 | 900p and smaller screens |
+| 4 | 1920×1088 | 1080p |
+| 5 | 2400×1360 | 1440p |
+| 6 | 2880×1632 | 1440p+ with supersampling, 4K |
+
+`0` (auto) picks the multiple of 272 nearest to the window height: the desktop height in
+fullscreen, otherwise the height from `resolution`. For the sharpest picture, use a window height that
+is a multiple of 272 (544, 816, 1088, …) or let auto pick, and keep `filter = linear`.
+
+The GPU cost grows with N². On an integrated AMD Radeon ("Phoenix" APU), N = 4 holds 120 fps in races and
+N = 6 holds 60. The `software` renderer is much slower (about 60 fps at N = 1 and 18 fps at N = 3) and is
+there as a reference.
+
+### Frame rate
+
+On the PSP, the game runs races at 30 fps. Its simulation is time-based (each tick advances by
+1/rate seconds), so the port can raise the race rate to 60 or 120 fps. `30` keeps the original
+behaviour. Menus are not affected.
+
+The rider's speed, physics and race timer stay correct at every setting; the race timer was
+verified 1:1 with the wall clock at 60 and 120. If you see tearing, turn on `vsync`. With
+vsync on, a monitor refresh below the chosen rate caps the frame rate.
+
+### Gamepads
+
+Any pad that SDL2 recognises as a game controller should work (Xbox, PlayStation, Switch Pro and most
+clones). It can be plugged in before or after the game starts, and several pads at once are fine.
+Tested with a wired Xbox 360 pad.
+
+| PSP | Xbox-style pad | Keyboard |
+|---|---|---|
+| D-pad | D-pad (and the right stick with `right_stick_dpad`) | arrow keys |
+| Analog nub | left stick | I / J / K / L |
+| ✕ Cross | A | Z |
+| ○ Circle | B | X |
+| □ Square | X | A |
+| △ Triangle | Y | S |
+| L | LB or LT | Q |
+| R | RB or RT | E |
+| Start | Start | Enter |
+| Select | Back | Backspace or right Shift |
+| none | none | F11 = toggle fullscreen |
+
+Keyboard and pads can be used at the same time.
+
+If your pad isn't recognised (nothing happens, or the buttons are mixed up), create a mapping line
+with a tool such as the SDL2 Gamepad Tool or
+[SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB) and put it in `ssx.ini`:
+
+```ini
+pad_mapping = 03000000xxxxxxxxxxxxxxxxxxxxxxxx,My Pad,a:b0,b:b1,x:b2,y:b3,back:b6,start:b7,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,lefttrigger:a2,righttrigger:a5,platform:Linux,
+```
+
+SDL also reads the `SDL_GAMECONTROLLERCONFIG` environment variable, which holds the same kind of line.
+
+## Paths
+
+`ssx` (and therefore `run.sh`) also accepts these flags. You only need them if you moved the
+files after building:
+
+| Flag | Default (set at build time) | Contents |
+|---|---|---|
+| `--umd DIR` | `<repo>/extracted` | extracted UMD file system (`disc0:`) |
+| `--iso FILE` | the ISO given to `setup.sh` | raw image, used for raw `umd0:` sector reads |
+| `--image FILE` | `<repo>/build/gen/image.bin` | initial memory image of the recompiled game |
+| `--assets DIR` | `<repo>/runtime/assets` | runtime data (VFPU tables) |
+| `--ms DIR` | `ms0` (in the working directory, so `run/ms0`) | the memory stick (`ms0:`) |
+
+### Saves
+
+Saves are stored on the virtual memory stick, in the same layout as on a PSP:
+
+```
+run/ms0/PSP/SAVEDATA/ULUS10042001/
+    DATA.BIN  PARAM.SFO  ICON0.PNG  ICON1.PMF
+```
+
+To back up your progress, copy that folder. These saves are **not encrypted**, so they can't yet be
+copied to a real PSP or to PPSSPP, and saves from those can't be loaded either.
+
+## Files written at run time
+
+| File (in `run/`) | Contents |
+|---|---|
+| `ssx.log` | runtime log; it is overwritten on every start, so keep a copy when reporting a bug |
+| `ms0/` | memory stick (saves) |
+| `shot_NNN.ppm` | screenshots, only with `SSX_SHOT_EVERY` |
+
+## Debugging environment variables
+
+These are for development. A normal player never needs them.
+
+| Variable | Example | Effect |
+|---|---|---|
+| `SSX_LOG` | `SSX_LOG=io,ge` | log only these channels: `kernel thread io display ge audio misc` (`rt` and `unimpl` are always on) |
+| `SSX_FPS` | `SSX_FPS=2` | log fps and per-frame timings every 2 s |
+| `SSX_SHOT_EVERY` | `SSX_SHOT_EVERY=5` | write a screenshot every 5 s |
+| `SSX_INPUT` | `SSX_INPUT="16=start,20.5=cross+down,30=cross:1.0"` | scripted button presses: `seconds=buttons[:duration]` (buttons: `cross circle square triangle up down left right l r start select`) |
+| `SSX_GETRACE_AT` | `SSX_GETRACE_AT=40` | dump one frame of GE commands at 40 s |
+| `SSX_VBTRACE_AT` | `SSX_VBTRACE_AT=40` | timeline of vblanks, GE and waits around 40 s |
+| `SSX_GE_THREADS` | `SSX_GE_THREADS=8` | rasteriser threads of the software renderer |
+
+`--headless` runs without a window and without sound (for automated tests together with
+`SSX_INPUT` and `SSX_SHOT_EVERY`).

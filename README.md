@@ -9,62 +9,49 @@ dumped from a UMD you own. The setup script reads that dump and generates everyt
 the extracted UMD file system, the function analysis, the recompiled C++, and the executable. None of
 this output is tracked by git (see `.gitignore`), so please don't commit it, upload it or share it.
 
-## Requirements
+## Quick start
 
-- Linux x86-64, a GPU with OpenGL 3.3 (`GL_ARB_shader_stencil_export` is used when available)
-- clang (C++20), CMake ≥ 3.20, Ninja
-- SDL2 and FFmpeg development packages (libavcodec, libavutil, libswscale), pkg-config
-- Python ≥ 3.10 (the setup creates a venv with [rabbitizer](https://github.com/Decompollaborate/rabbitizer))
+1. Install the build dependencies. On Debian/Ubuntu:
 
-On Debian/Ubuntu:
+   ```sh
+   sudo apt install clang cmake ninja-build pkg-config python3-venv \
+       libsdl2-dev libavcodec-dev libavutil-dev libswscale-dev
+   ```
 
-```sh
-sudo apt install clang cmake ninja-build pkg-config python3-venv \
-    libsdl2-dev libavcodec-dev libavutil-dev libswscale-dev
-```
-
-## Building from your dump
-
-1. Dump your UMD to an ISO with a PSP running custom firmware (for example, the "UMD → ISO" function of
-   your CFW's VSH menu, or an ISO-dumping homebrew). Only the retail USA release is supported. The
-   script checks the game ID and the SHA-1 of `BOOT.BIN`, and it rejects other revisions and modified images.
-2. Run:
+   Other distributions are covered in [docs/BUILDING.md](docs/BUILDING.md).
+2. Dump your UMD of the **USA release (`ULUS-10042`)** to an `.iso` with a PSP running custom firmware.
+3. Build from your dump. This takes about a minute and only needs to be done once:
 
    ```sh
    ./setup.sh /path/to/your/ssx-on-tour.iso      # a .zip holding the .iso also works
    ```
 
-   This takes a few minutes. It extracts the UMD, analyses `BOOT.BIN`, recompiles it into
-   `build/gen/`, and builds `build/cmake/ssx`. You can run it again at any time: completed steps are
-   skipped, and `--force` redoes them.
-3. Play:
+   The script checks that the image is the right game (game ID and the SHA-1 of `BOOT.BIN`),
+   extracts it, recompiles the game into C++ and builds `build/cmake/ssx`.
+4. Play:
 
    ```sh
-   ./run.sh                          # or e.g. ./run.sh --fps 60 --res 1920x1088 --fullscreen
+   ./run.sh                                       # 960×544 window, original 30 fps
+   ./run.sh --fps 60 --res 1920x1080 --fullscreen
    ```
 
-Saves go to `run/ms0/PSP/SAVEDATA/`. Settings can go in `run/ssx.ini` (see `ssx.ini.example`), and
-`./run.sh --help` lists every option.
+## Documentation
 
-## Controls
-
-| PSP | Keyboard | Xbox-style pad |
-|---|---|---|
-| D-pad | arrow keys | D-pad (or the right stick with `--right-stick-dpad`) |
-| Analog nub | I J K L | left stick |
-| ✕ ○ □ △ | Z X A S | A B X Y |
-| L / R | Q / E | LB / RB or LT / RT |
-| Start / Select | Enter / Backspace | Start / Back |
-
-F11 toggles fullscreen.
+- [docs/BUILDING.md](docs/BUILDING.md): dependencies, dumping, every `setup.sh` option, what gets
+  generated, building by hand, troubleshooting
+- [docs/OPTIONS.md](docs/OPTIONS.md): every setting (`ssx.ini` and flags), resolution and frame
+  rate, controls and gamepads, saves, debugging variables
+- [NOTES.md](NOTES.md): technical notes on the recompiler and the runtime
 
 ## Features
 
-- Frame rate of 30 (original), 60 or 120 fps, with the game's own tick raised so physics and race
-  timing stay correct
-- True internal resolution rendering on the GPU (`--render-scale N` = 480×272·N), not upscaling
-- ATRAC3+ music, PSMF movies, real save files
-- Not done yet: sound effects (SAS), saves that work on a real PSP, system dialog UI, network play
+- Native x86-64 code, translated ahead of time from the game's MIPS (Allegrex) executable
+- Rendering on the GPU (OpenGL 3.3) at a real internal resolution of up to 2880×1632
+  (`--render-scale 1..6`), not an upscaled 480×272 image
+- 30 (original), 60 or 120 fps in races, with physics and race timing kept correct
+- Xbox-style gamepads (hot-plug) and the keyboard
+- ATRAC3+ music, PSMF/H.264 movies, saves on a virtual memory stick
+- Not done yet: sound effects (SAS), saves that work on a real PSP, the system dialog UI, network play
 
 ## How it works
 

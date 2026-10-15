@@ -35,7 +35,8 @@ with a custom runtime (HLE kernel, GE→OpenGL, audio via SDL).
   IoFileMgr 14, Adhocctl 10, sceAudio 9, Atrac3plus 8 …
 
 ## Build & run
-    .venv/bin/python tools/gen_nids.py third_party/ppsspp-1.20.4 data/nids.json   # once
+    ./setup.sh <your ULUS-10042 dump>   # everything below, from the dump (docs/BUILDING.md)
+    .venv/bin/python tools/gen_nids.py third_party/ppsspp-1.20.4 data/nids.json   # only to regenerate the committed table
     .venv/bin/python tools/analyze.py && .venv/bin/python tools/recomp.py
     cmake -S . -B build/cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ && ninja -C build/cmake ssx
     ./run.sh [--fps 30|60|120] [--res WxH] [--fullscreen] [--filter nearest] ...   # or ssx.ini (see ssx.ini.example)
