@@ -36,8 +36,12 @@ static void on_term(int) {
 	_exit(3);
 }
 
+static void on_int(int) { _exit(0); }   // the window goes away with the process
+
 int main(int argc, char **argv) {
 	signal(SIGTERM, on_term);
+	signal(SIGINT, on_int);
+	signal(SIGHUP, on_int);
 	std::string image = SSX_DEFAULT_IMAGE;
 	bool headless = false;
 	g_umd_root = SSX_DEFAULT_UMD;
@@ -66,6 +70,7 @@ int main(int argc, char **argv) {
 	dispatch_init();
 	hle_init_imports();
 	kernel_reserve_image();
+	{ extern int g_render_scale; if (headless) g_render_scale = settings_render_scale(); }
 	display_init(headless);
 	void audio_init(bool headless);
 	audio_init(headless);
@@ -73,5 +78,7 @@ int main(int argc, char **argv) {
 	kernel_start_module(g_image_entry);
 	kernel_run();
 	rt_log(LOG_RT, "exit");
-	return 0;
+	void platform_shutdown();
+	platform_shutdown();
+	_exit(0);
 }

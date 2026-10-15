@@ -66,6 +66,16 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
 - Game alarm must be rescheduled from the scheduled time (drift lost frames).
 - Raster cost ~60 ns/px (775k px/frame in races); GE list 9-13 ms; guest code itself ~1-5 ms/frame.
 
+## Internal resolution (render_scale)
+- Every GE colour/depth target gets an S x S shadow (RGBA8888 / u16) in ge_render.cpp; vertices,
+  scissor and through-mode coords are scaled; the display shows the shadow.
+- Shadows are averaged back into VRAM at every FINISH (only the drawn rectangle) and before a texture
+  or block transfer reads from them. Writing undrawn/stale shadow areas back corrupted display lists
+  the game keeps in VRAM (it CALLs lists at 0x040f1200 / 0x041de200) -> runaway GE list.
+- Speed (races, this PC, 15 raster threads): S=1 60 fps in 60 mode; S=2 ~30; S=3 ~18; S=4 ~11.
+  ~45 ns/px software shading is the limit -> needs SIMD spans or a GPU backend for high S.
+- Bezier patches (cmd 0x05) draw the snow terrain; control points are skinned (vtype 0x780).
+
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never
 committed (see .gitignore).

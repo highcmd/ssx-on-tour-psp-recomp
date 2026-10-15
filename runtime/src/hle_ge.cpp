@@ -89,15 +89,28 @@ static bool run_list(DisplayList &l, std::unique_lock<std::mutex> &lk) {
 		s_ge_cmds[cmd] = op;
 		g_ge_base = l.base;
 		g_ge_offset = l.offset;
+		{
+			static int nopRun, reported;
+			if (op == 0) {
+				if (++nopRun == 10000 && reported++ < 3)
+					rt_log(LOG_GE, "runaway list %d: start %08x pc %08x stall %08x base %08x offset %08x sp %d", l.id, l.start, pc, l.stall, l.base, l.offset, l.sp);
+			} else nopRun = 0;
+		}
 		switch (cmd) {
 		case 0x08:  // JUMP
 			l.pc = ge_addr(l, op) & ~3u;
+			{
+				static int n;
+				if (getenv("SSX_JUMPDBG") && l.pc <= pc && pc - l.pc < 0x40 && n++ < 10)
+					rt_log(LOG_GE, "backward JUMP %08x -> %08x (list %d start %08x stall %08x)", pc, l.pc, l.id, l.start, l.stall);
+			}
 			break;
 		case 0x09:  // BJUMP (conditional on bounding box; we never cull)
 			break;
 		case 0x0A:  // CALL
 			if (l.sp < 32) l.stack[l.sp++] = l.pc, l.stack[l.sp++] = l.offset;
 			l.pc = ge_addr(l, op) & ~3u;
+			{ static int n; if (getenv("SSX_CALLDBG") && rt_time_us() > 54000000 && n++ < 60) rt_log(LOG_GE, "CALL into VRAM %08x from %08x (list %d)", l.pc, pc, l.id); }
 			break;
 		case 0x0B:  // RET
 			if (l.sp >= 2) { l.offset = l.stack[--l.sp]; l.pc = l.stack[--l.sp]; }
@@ -115,6 +128,7 @@ static bool run_list(DisplayList &l, std::unique_lock<std::mutex> &lk) {
 			if (trace_on()) rt_log(LOG_GE, "FINISH (GE thread) t=%.2f", rt_time_us() / 1e3);
 			ge_exec_cmd(cmd, op, pc);
 			ge_flush();
+			{ void ge_resolve_all(); ge_resolve_all(); }
 			post_callback(l.cbid, op & 0xFFFF, true);
 			break;
 		case 0x10:  // BASE
@@ -189,6 +203,7 @@ static bool ge_drawing() {
 static int enqueue(u32 listAddr, u32 stall, int cbid, bool head) {
 	ensure_thread();
 	if (trace_on()) rt_log(LOG_GE, "EnQueue %08x stall %08x t=%.2f", listAddr, stall, rt_time_us() / 1e3);
+	{ static int n; if (getenv("SSX_ENQDBG") && n++ < 4000) rt_log(LOG_GE, "EnQueue %08x stall %08x cb %d head %d qlen %zu busy %d", listAddr, stall, cbid, head, s_queue.size(), s_busy); }
 	std::lock_guard<std::mutex> lk(s_mtx);
 	DisplayList l{};
 	l.id = s_next_list++;
