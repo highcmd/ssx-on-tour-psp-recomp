@@ -5,62 +5,6 @@
 
 #include "kernel.h"
 
-// ------------------------------------------------------------- sceAudio
-struct AudioChan {
-	bool reserved = false;
-	u32 samples = 0;
-	u32 fmt = 0;
-	u64 busyUntil = 0;
-};
-static AudioChan s_chans[8];
-
-static int reserve_chan(int ch) {
-	if (ch < 0) {
-		for (int i = 7; i >= 0; i--)
-			if (!s_chans[i].reserved) { ch = i; break; }
-		if (ch < 0) return 0x80260002;
-	}
-	if (ch > 7) return 0x80260002;
-	s_chans[ch].reserved = true;
-	return ch;
-}
-
-HLE(sceAudio, sceAudioChReserve) {
-	int ch = reserve_chan((int)ARG(0));
-	if (ch >= 0 && ch < 8) { s_chans[ch].samples = ARG(1); s_chans[ch].fmt = ARG(2); }
-	rt_log(LOG_AUDIO, "ChReserve(%d, %u, %u) -> %d", (int)ARG(0), ARG(1), ARG(2), ch);
-	RET(ch);
-}
-HLE(sceAudio, sceAudioChRelease) { if (ARG(0) < 8) s_chans[ARG(0)].reserved = false; RET(0); }
-HLE(sceAudio, sceAudioSetChannelDataLen) { if (ARG(0) < 8) s_chans[ARG(0)].samples = ARG(1); RET(0); }
-HLE(sceAudio, sceAudioChangeChannelConfig) { if (ARG(0) < 8) s_chans[ARG(0)].fmt = ARG(1); RET(0); }
-HLE(sceAudio, sceAudioChangeChannelVolume) { RET(0); }
-
-// A blocking output returns once the previous buffer has been played (44.1 kHz).
-static void audio_output(CPUState *c, bool blocking) {
-	u32 ch = ARG(0);
-	if (ch >= 8 || !s_chans[ch].reserved) { RET(0x80260008); return; }
-	AudioChan &a = s_chans[ch];
-	u64 now = rt_time_us();
-	if (a.busyUntil > now) {
-		if (!blocking) { RET(0x80260009); return; }  // busy
-		kernel_wait(WAIT_AUDIO, ch, a.busyUntil - now, false);
-		now = rt_time_us();
-	}
-	u64 dur = (u64)a.samples * 1000000ull / 44100;
-	a.busyUntil = std::max(a.busyUntil, now) + dur;
-	RET(a.samples);
-}
-HLE(sceAudio, sceAudioOutputBlocking) { audio_output(c, true); }
-HLE(sceAudio, sceAudioOutputPannedBlocking) { audio_output(c, true); }
-HLE(sceAudio, sceAudioOutputPanned) { audio_output(c, false); }
-HLE(sceAudio, sceAudioGetChannelRestLength) {
-	u32 ch = ARG(0);
-	if (ch >= 8) { RET(0x80260008); return; }
-	u64 now = rt_time_us();
-	RET(s_chans[ch].busyUntil > now ? (u32)((s_chans[ch].busyUntil - now) * 44100 / 1000000) : 0);
-}
-
 // ------------------------------------------------------------- sceSasCore
 static u32 s_sas_grain = 256, s_sas_outmode = 0;
 HLE(sceSasCore, __sceSasInit) {
@@ -76,32 +20,6 @@ HLE(sceSasCore, __sceSasCore) {
 }
 HLE(sceSasCore, __sceSasGetEndFlag) { RET(0xFFFFFFFF); }  // all voices ended
 HLE(sceSasCore, __sceSasGetEnvelopeHeight) { RET(0); }
-
-// ------------------------------------------------------------- sceAtrac3plus
-static int s_next_atrac = 0;
-HLE(sceAtrac3plus, sceAtracSetDataAndGetID) {
-	int id = s_next_atrac++ & 3;
-	rt_log(LOG_AUDIO, "AtracSetDataAndGetID(%08x, %x) -> %d", ARG(0), ARG(1), id);
-	RET(id);
-}
-HLE(sceAtrac3plus, sceAtracReleaseAtracID) { RET(0); }
-HLE(sceAtrac3plus, sceAtracDecodeData) {
-	// (id, outbuf, *samples, *finish, *remainFrames)
-	if (ARG(2)) SW(ARG(2), 0);
-	if (ARG(3)) SW(ARG(3), 1);
-	if (ARG(4)) SW(ARG(4), (u32)-1);
-	RET(0x80630024);  // ALL_DATA_DECODED
-}
-HLE(sceAtrac3plus, sceAtracGetMaxSample) { if (ARG(1)) SW(ARG(1), 2048); RET(0); }
-HLE(sceAtrac3plus, sceAtracGetNextSample) { if (ARG(1)) SW(ARG(1), 0); RET(0); }
-HLE(sceAtrac3plus, sceAtracGetStreamDataInfo) {
-	if (ARG(1)) SW(ARG(1), 0);
-	if (ARG(2)) SW(ARG(2), 0);
-	if (ARG(3)) SW(ARG(3), 0);
-	RET(0);
-}
-HLE(sceAtrac3plus, sceAtracAddStreamData) { RET(0); }
-HLE(sceAtrac3plus, sceAtracSetLoopNum) { RET(0); }
 
 // ------------------------------------------------------------- sceUtility dialogs
 // Status: 0 none, 1 init, 2 running, 3 finished, 4 shutdown.
