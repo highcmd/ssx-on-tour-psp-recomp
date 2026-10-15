@@ -722,7 +722,7 @@ static void setup_pipe(bool through) {
 		p.sx0 *= S; p.sy0 *= S;
 		p.sx1 = (p.sx1 + 1) * S - 1; p.sy1 = (p.sy1 + 1) * S - 1;
 	}
-	p.sx1 = std::min<int>(p.sx1, p.tgt.stride - 1);
+	p.sx1 = std::min<int>(p.sx1, p.tgt.vstride * g_render_scale - 1);
 	p.sy1 = std::min(p.sy1, 512 * g_render_scale - 1);
 	p.through = through;
 	p.clear = R[0xd3] & 1;
