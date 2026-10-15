@@ -90,6 +90,15 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
 - Races at 1920x1088 (S=4): 30/60/120 fps all hold; S=6 holds 60.
 - PSP DXT3/DXT5 store the colour block first, then alpha (fixed in both renderers).
 
+## Savedata (hle_savedata.cpp)
+- Host memory stick: `--ms <dir>` (default `./ms0` in the working dir) -> `PSP/SAVEDATA/ULUS10042<slot>/`
+  with DATA.BIN, PARAM.SFO (PSP keys: CATEGORY, PARENTAL_LEVEL, SAVEDATA_DETAIL/DIRECTORY/FILE_LIST/
+  PARAMS/TITLE, TITLE), ICON0.PNG (trimmed at IEND), ICON1.PMF.
+- SSX uses the V2 param struct (0x5DC, no key): LISTSAVE when the profile is created/saved, LISTLOAD
+  after START. List modes pick the slot the system dialog would focus (no UI drawn).
+- Data is stored unencrypted, so saves are not yet interchangeable with a real PSP. Doing that needs
+  the PSP savedata crypto (sceChnnlsv + KIRK, mode 1 for key-less games) and the SFO hashes, as PPSSPP has.
+
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never
 committed (see .gitignore).

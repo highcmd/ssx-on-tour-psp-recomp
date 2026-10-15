@@ -227,7 +227,17 @@ std::string pick_slot(u32 p, int mode) {
 	}
 	if (focus == 3 && !existing.empty()) return latest();
 	if (in(names, base)) return base;
-	return names[0];
+	// No usable focus (SSX passes name "000" with slots 001..005): never overwrite another
+	// save silently - take the first empty slot, or the least recently written one if all are used.
+	for (auto &n : names)
+		if (!in(existing, n)) return n;
+	std::string oldest;
+	time_t ot = 0;
+	for (auto &n : existing) {
+		time_t t = mtime_of(dir_for(p, n));
+		if (oldest.empty() || t < ot) { oldest = n; ot = t; }
+	}
+	return oldest.empty() ? names[0] : oldest;
 }
 
 u32 do_save(u32 p, const std::string &saveName) {
@@ -432,9 +442,17 @@ u32 run_request(u32 p) {
 		slot = pick_slot(p, 5);
 		put_str(p + P_SAVE, slot, 20);
 		return do_save(p, slot);
-	case 6:                                                                                   // LISTDELETE
-		slot = pick_slot(p, 6);
+	case 6: {                                                                                 // LISTDELETE
+		// Without the system list we only delete an unambiguous save; otherwise "cancelled".
+		std::string base = fixed_str(p + P_SAVE, 20);
+		std::vector<std::string> existing;
+		for (auto &n : save_name_list(p)) if (is_dir(dir_for(p, n))) existing.push_back(n);
+		if (std::find(existing.begin(), existing.end(), base) != existing.end()) slot = base;
+		else if (existing.size() == 1) slot = existing[0];
+		else return 1;   // SCE_UTILITY_DIALOG_RESULT_CANCEL
+		put_str(p + P_SAVE, slot, 20);
 		return do_delete(p, slot) ? 0 : DELETE_NO_DATA;
+	}
 	case 7: return 0;                                                                        // LISTALLDELETE (user cancels)
 	case 8: return do_sizes(p);                                                               // SIZES
 	case 9: case 10: return do_delete(p, fixed_str(p + P_SAVE, 20)) ? 0 : DELETE_NO_DATA;   // AUTODELETE, DELETE
@@ -456,6 +474,11 @@ HLE(sceUtility, sceUtilitySavedataInitStart) {
 	u32 mode = LW(p + P_MODE);
 	rt_log(LOG_MISC, "Savedata %s: game '%s' save '%s' file '%s' (struct %x)", mode < 23 ? kModeNames[mode] : "?",
 	       fixed_str(p + P_GAME, 13).c_str(), fixed_str(p + P_SAVE, 20).c_str(), fixed_str(p + P_FILE, 13).c_str(), LW(p + P_SIZE));
+	if (mode == 4 || mode == 5 || mode == 6) {
+		std::string names;
+		for (auto &n : save_name_list(p)) names += n + " ";
+		rt_log(LOG_MISC, "  focus %u, slots: %s", LW(p + P_FOCUS), names.c_str());
+	}
 	u32 r = run_request(p);
 	SW(p + P_RESULT, r);
 	if (r) rt_log(LOG_MISC, "  -> result %08x", r);
