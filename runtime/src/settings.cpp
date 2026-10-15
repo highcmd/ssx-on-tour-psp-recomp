@@ -30,6 +30,9 @@ static bool apply_setting(const std::string &k, const std::string &v) {
 		int n = atoi(v.c_str());
 		if (n < 1) return false;
 		s.width = 480 * n; s.height = 272 * n;
+	} else if (k == "renderer") {
+		if (v != "gl" && v != "software") { fprintf(stderr, "renderer must be gl or software\n"); return false; }
+		s.renderer = v;
 	} else if (k == "render_scale") {
 		int n = atoi(v.c_str());
 		if (n < 0 || n > 6) { fprintf(stderr, "render_scale must be 0 (auto) .. 6\n"); return false; }
@@ -69,7 +72,7 @@ bool settings_parse_arg(int argc, char **argv, int &i) {
 	for (auto &ch : k) if (ch == '-') ch = '_';
 	if (k == "fullscreen" || k == "vsync" || k == "right_stick_dpad") return apply_setting(k, "1");
 	if (k == "windowed") { g_settings.fullscreen = false; return true; }
-	if (k == "fps" || k == "render_scale" || k == "res" || k == "resolution" || k == "scale" || k == "filter" || k == "deadzone" || k == "pad_mapping") {
+	if (k == "fps" || k == "renderer" || k == "render_scale" || k == "res" || k == "resolution" || k == "scale" || k == "filter" || k == "deadzone" || k == "pad_mapping") {
 		if (i + 1 >= argc) return false;
 		return apply_setting(k, argv[++i]);
 	}
@@ -87,7 +90,8 @@ int settings_render_scale() {
 }
 
 const char *settings_usage() {
-	return "  --render-scale N         internal resolution 480x272 x N (default: match the window height, e.g. 1088 -> 4)\n"
+	return "  --renderer gl|software  GPU (OpenGL 3.3, default) or the CPU reference renderer\n"
+	       "  --render-scale N         internal resolution 480x272 x N (default: match the window height, e.g. 1088 -> 4)\n"
 	       "  --fps 30|60|120          game rate (30 = original; 60/120 raise the engine's tick, see NOTES.md)\n"
 	       "  --res WxH | --scale N    window size (default 960x544); --fullscreen; --filter linear|nearest; --vsync\n"
 	       "  --deadzone N             gamepad stick deadzone 0..32767 (default 8000); --right-stick-dpad\n"

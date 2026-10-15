@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
 	dispatch_init();
 	hle_init_imports();
 	kernel_reserve_image();
-	{ extern int g_render_scale; if (headless) g_render_scale = settings_render_scale(); }
+	{ extern int g_render_scale; g_render_scale = settings_render_scale(); }
 	display_init(headless);
 	void audio_init(bool headless);
 	audio_init(headless);
