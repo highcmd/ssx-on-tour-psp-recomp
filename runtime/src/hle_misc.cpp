@@ -28,7 +28,7 @@ struct Dialog {
 	u32 param = 0;
 	int ticks = 0;
 };
-static Dialog s_save, s_msg, s_osk, s_net;
+static Dialog s_msg, s_osk, s_net;
 
 static int dlg_status(Dialog &d) {
 	int s = d.status;
@@ -43,22 +43,6 @@ static void dlg_start(Dialog &d, u32 param, const char *what) {
 	d.ticks = 0;
 	rt_log(LOG_MISC, "%s InitStart(%08x)", what, param);
 }
-
-HLE(sceUtility, sceUtilitySavedataInitStart) {
-	dlg_start(s_save, ARG(0), "Savedata");
-	u32 p = ARG(0);
-	u32 mode = LW(p + 0x30);
-	std::string game((const char *)gptr(p + 0x3C), strnlen((const char *)gptr(p + 0x3C), 13));
-	std::string save((const char *)gptr(p + 0x4C), strnlen((const char *)gptr(p + 0x4C), 20));
-	rt_log(LOG_MISC, "  savedata mode %u game '%s' save '%s'", mode, game.c_str(), save.c_str());
-	// No save system yet: every load/list reports "no data", every save "succeeds".
-	bool load = mode == 0 || mode == 2 || mode == 4 || mode == 6 || mode == 11 || mode == 12 || mode == 15;
-	SW(p + 0x1C, load ? 0x80110307 : 0);
-	RET(0);
-}
-HLE(sceUtility, sceUtilitySavedataGetStatus) { RET(dlg_status(s_save)); }
-HLE(sceUtility, sceUtilitySavedataUpdate) { if (s_save.status == 2) s_save.status = 3; RET(0); }
-HLE(sceUtility, sceUtilitySavedataShutdownStart) { s_save.status = 4; RET(0); }
 
 HLE(sceUtility, sceUtilityMsgDialogInitStart) {
 	dlg_start(s_msg, ARG(0), "MsgDialog");

@@ -47,6 +47,7 @@ add_executable(ssx
   runtime/src/hle_misc.cpp
   runtime/src/hle_mpeg.cpp
   runtime/src/hle_audio.cpp
+  runtime/src/hle_savedata.cpp
   runtime/src/settings.cpp
   runtime/src/game_hooks.cpp
   runtime/src/gl_funcs.cpp
