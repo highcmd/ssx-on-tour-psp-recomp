@@ -1,36 +1,156 @@
-// IoFileMgrForUser: disc0:/umd0: -> extracted UMD tree, ms0: -> ./ms0 (saves).
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+// IoFileMgrForUser: disc0:/umd0: -> the UMD image (or an extracted copy with
+// --umd), ms0: -> ./ms0 (saves).
 #include <algorithm>
-#include <ctime>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
+#include <system_error>
+#include <unordered_map>
+#include <vector>
 
 #include "kernel.h"
+#include "platform.h"
 
-std::string g_umd_root = "extracted";
-std::string g_iso_path;   // raw UMD image for umd0: block access and sce_lbn opens
+namespace fs = std::filesystem;
+
+std::string g_umd_root;   // extracted UMD tree; empty = read the files from the ISO
+std::string g_iso_path;   // raw UMD image: disc0: files, umd0: block access, sce_lbn opens
 std::string g_ms_root = "ms0";
+
+struct DirEntry {
+	std::string name;
+	bool dir = false;
+	u64 size = 0;
+	time_t mtime = 0;
+};
 
 struct OpenFile {
 	FILE *f = nullptr;
-	DIR *d = nullptr;
+	bool isDir = false;
+	std::vector<DirEntry> entries;   // directories: listed at dopen
+	size_t dirPos = 0;
 	std::string path;
 	bool blockMode = false;   // umd0: device: read/seek in 2048-byte sectors
-	bool raw = false;         // sce_lbn: byte window [rawStart, rawStart+rawSize) of the ISO
+	bool raw = false;         // byte window [rawStart, rawStart+rawSize) of the ISO
 	u64 rawStart = 0, rawSize = 0;
+	bool isoFile = false;     // a file of the UMD image (window = the whole file, may be empty)
 	s64 asyncResult = 0;
 	bool asyncPending = false;
 };
 static std::map<int, OpenFile> s_files;
 static int s_next_fd = 3;
 
-// Case-insensitive path resolution (UMD is case-insensitive, our extracted copy is not).
+static std::string lower(std::string s) {
+	for (auto &ch : s) ch = (char)tolower((unsigned char)ch);
+	return s;
+}
+
+// ------------------------------------------------------------- ISO 9660 reader
+// The UMD's file system, indexed once: lower-case path -> extent. Files on a UMD
+// are contiguous, so an open file is a byte window into the image.
+struct IsoNode {
+	u64 offset = 0, size = 0;
+	bool dir = false;
+	time_t mtime = 0;
+	std::vector<std::string> children;   // original-case names
+};
+static std::unordered_map<std::string, IsoNode> s_iso;
+static bool s_iso_ok;
+
+static time_t iso_time(const u8 *d) {
+	struct tm t{};
+	t.tm_year = d[0];
+	t.tm_mon = d[1] - 1;
+	t.tm_mday = d[2];
+	t.tm_hour = d[3];
+	t.tm_min = d[4];
+	t.tm_sec = d[5];
+	t.tm_isdst = -1;
+	return mktime(&t);
+}
+
+static void iso_scan(FILE *f, const std::string &path, u32 lba, u32 size, int depth) {
+	if (depth > 16) return;
+	std::vector<u8> buf(size);
+	if (fseeko(f, (s64)lba * 2048, SEEK_SET) != 0 || fread(buf.data(), 1, size, f) != size) return;
+	for (u32 off = 0; off < size;) {
+		u8 len = buf[off];
+		if (len == 0) { off = (off / 2048 + 1) * 2048; continue; }   // records never cross a sector
+		if (off + 33 > size || off + len > size) break;
+		const u8 *r = &buf[off];
+		u8 nlen = r[32];
+		std::string name((const char *)r + 33, nlen);
+		off += len;
+		if (nlen == 1 && (name[0] == 0 || name[0] == 1)) continue;   // . and ..
+		name = name.substr(0, name.find(';'));
+		IsoNode n;
+		u32 elba, esize;
+		memcpy(&elba, r + 2, 4);
+		memcpy(&esize, r + 10, 4);
+		n.offset = (u64)elba * 2048;
+		n.size = esize;
+		n.dir = r[25] & 2;
+		n.mtime = iso_time(r + 18);
+		std::string full = path.empty() ? name : path + "/" + name;
+		s_iso[path].children.push_back(name);
+		s_iso[lower(full)] = n;
+		if (n.dir) iso_scan(f, lower(full), elba, esize, depth + 1);
+	}
+}
+
+static bool iso_init() {
+	static bool done;
+	if (done) return s_iso_ok;
+	done = true;
+	FILE *f = g_iso_path.empty() ? nullptr : fopen(g_iso_path.c_str(), "rb");
+	if (!f) {
+		rt_log_error("cannot open the UMD image '%s' (--iso)", g_iso_path.c_str());
+		return false;
+	}
+	u8 pvd[2048];
+	if (fseeko(f, 16 * 2048, SEEK_SET) == 0 && fread(pvd, 1, 2048, f) == 2048 && pvd[0] == 1 && !memcmp(pvd + 1, "CD001", 5)) {
+		u32 lba, size;
+		memcpy(&lba, pvd + 156 + 2, 4);
+		memcpy(&size, pvd + 156 + 10, 4);
+		IsoNode &root = s_iso[""];
+		root.dir = true;
+		iso_scan(f, "", lba, size, 0);
+		s_iso_ok = true;
+		rt_log(LOG_IO, "UMD image %s: %zu entries", g_iso_path.c_str(), s_iso.size());
+	} else {
+		rt_log_error("'%s' is not an ISO 9660 image", g_iso_path.c_str());
+	}
+	fclose(f);
+	return s_iso_ok;
+}
+
+static bool umd_from_iso() { return g_umd_root.empty(); }
+
+static const IsoNode *iso_find(const std::string &rel) {
+	if (!iso_init()) return nullptr;
+	std::string key;
+	size_t i = 0;
+	while (i <= rel.size()) {   // normalise: drop empty and "." parts
+		size_t j = rel.find('/', i);
+		if (j == std::string::npos) j = rel.size();
+		std::string part = rel.substr(i, j - i);
+		i = j + 1;
+		if (part.empty() || part == ".") continue;
+		key += (key.empty() ? "" : "/") + lower(part);
+	}
+	auto it = s_iso.find(key);
+	return it == s_iso.end() ? nullptr : &it->second;
+}
+
+// ------------------------------------------------------------- host paths
+// Case-insensitive path resolution (UMD is case-insensitive, an extracted copy may not be).
 static std::string resolve_ci(const std::string &root, const std::string &rel) {
 	std::string cur = root;
 	size_t i = 0;
+	std::error_code ec;
 	while (i <= rel.size()) {
 		size_t j = rel.find('/', i);
 		if (j == std::string::npos) j = rel.size();
@@ -38,14 +158,11 @@ static std::string resolve_ci(const std::string &root, const std::string &rel) {
 		i = j + 1;
 		if (part.empty() || part == ".") continue;
 		std::string exact = cur + "/" + part;
-		struct stat st;
-		if (stat(exact.c_str(), &st) == 0) { cur = exact; continue; }
-		DIR *d = opendir(cur.c_str());
+		if (fs::exists(u8p(exact), ec)) { cur = exact; continue; }
 		bool found = false;
-		if (d) {
-			while (dirent *e = readdir(d))
-				if (!strcasecmp(e->d_name, part.c_str())) { cur += "/" + std::string(e->d_name); found = true; break; }
-			closedir(d);
+		for (fs::directory_iterator it(u8p(cur), ec), e; !ec && it != e; it.increment(ec)) {
+			std::string n = u8s(it->path().filename());
+			if (lower(n) == lower(part)) { cur += "/" + n; found = true; break; }
 		}
 		if (!found) cur = exact;
 	}
@@ -54,34 +171,49 @@ static std::string resolve_ci(const std::string &root, const std::string &rel) {
 
 static std::string s_cwd = "disc0:/PSP_GAME/USRDIR";
 
-std::string io_host_path(const std::string &guest) {
+// Split a guest path into (lower-case device, path on the device).
+static void split_guest(const std::string &guest, std::string &dev, std::string &rel) {
 	std::string p = guest;
 	std::replace(p.begin(), p.end(), '\\', '/');
 	size_t colon = p.find(':');
-	std::string dev, rel;
-	if (colon == std::string::npos) {
-		// relative to cwd
-		std::string base = s_cwd;
-		colon = base.find(':');
-		dev = base.substr(0, colon);
-		rel = base.substr(colon + 1) + "/" + p;
+	if (colon == std::string::npos) {   // relative to cwd
+		size_t c = s_cwd.find(':');
+		dev = s_cwd.substr(0, c);
+		rel = s_cwd.substr(c + 1) + "/" + p;
 	} else {
 		dev = p.substr(0, colon);
 		rel = p.substr(colon + 1);
 	}
-	for (auto &ch : dev) ch = tolower(ch);
-	if (dev.rfind("disc", 0) == 0 || dev.rfind("umd", 0) == 0 || dev.rfind("host", 0) == 0)
-		return resolve_ci(g_umd_root, rel);
-	if (dev.rfind("ms", 0) == 0 || dev.rfind("fatms", 0) == 0) {
-		std::string full = g_ms_root + "/" + rel;
-		return full;
-	}
-	return g_umd_root + "/" + rel;
+	dev = lower(dev);
+}
+
+static bool is_umd_dev(const std::string &dev) {
+	return dev.rfind("disc", 0) == 0 || dev.rfind("umd", 0) == 0 || dev.rfind("host", 0) == 0;
+}
+
+std::string io_host_path(const std::string &guest) {
+	std::string dev, rel;
+	split_guest(guest, dev, rel);
+	if (dev.rfind("ms", 0) == 0 || dev.rfind("fatms", 0) == 0) return g_ms_root + "/" + rel;
+	return resolve_ci(g_umd_root.empty() ? std::string(".") : g_umd_root, rel);
+}
+
+// The UMD file for a guest path when the UMD comes from the image, else null.
+static const IsoNode *umd_iso_node(const std::string &guest) {
+	std::string dev, rel;
+	split_guest(guest, dev, rel);
+	if (!is_umd_dev(dev) || !umd_from_iso()) return nullptr;
+	return iso_find(rel);
+}
+static bool umd_iso_path(const std::string &guest) {
+	std::string dev, rel;
+	split_guest(guest, dev, rel);
+	return is_umd_dev(dev) && umd_from_iso();
 }
 
 static void mkdirs_for(const std::string &path) {
-	for (size_t i = 1; i < path.size(); i++)
-		if (path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755);
+	std::error_code ec;
+	fs::create_directories(u8p(path).parent_path(), ec);
 }
 
 static int open_raw(const std::string &g) {
@@ -125,6 +257,27 @@ HLE(IoFileMgrForUser, sceIoOpen) {
 	u32 flags = ARG(1);
 	int rfd = open_raw(g);
 	if (rfd != -1) { RET(rfd); return; }
+	if (umd_iso_path(g)) {
+		const IsoNode *n = umd_iso_node(g);
+		FILE *f = n && !n->dir && !(flags & 0x0002) ? fopen(g_iso_path.c_str(), "rb") : nullptr;
+		if (!f) {
+			LOGIO("open '%s' flags %x -> not found in the UMD image", g.c_str(), flags);
+			RET(SCE_ERROR_ERRNO_FILE_NOT_FOUND);
+			return;
+		}
+		fseeko(f, (s64)n->offset, SEEK_SET);
+		int fd = s_next_fd++;
+		OpenFile &of = s_files[fd];
+		of.f = f;
+		of.path = g;
+		of.raw = true;
+		of.rawStart = n->offset;
+		of.rawSize = n->size;
+		of.isoFile = true;
+		LOGIO("open '%s' flags %x -> %d (image)", g.c_str(), flags, fd);
+		RET(fd);
+		return;
+	}
 	std::string h = io_host_path(g);
 	const char *mode = "rb";
 	if (flags & 0x0002) {  // write
@@ -164,7 +317,7 @@ static s64 do_read(int fd, u32 buf, u32 size) {
 		return (s64)(fread(gptr(buf), 1, (size_t)size * 2048, of.f) / 2048);
 	if (of.raw) {
 		u64 pos = ftello(of.f) - of.rawStart;
-		if (of.rawSize && pos + size > of.rawSize) size = pos < of.rawSize ? (u32)(of.rawSize - pos) : 0;
+		if ((of.rawSize || of.isoFile) && pos + size > of.rawSize) size = pos < of.rawSize ? (u32)(of.rawSize - pos) : 0;
 	}
 	return (s64)fread(gptr(buf), 1, size, of.f);
 }
@@ -229,10 +382,41 @@ HLE(IoFileMgrForUser, sceIoChangeAsyncPriority) { RET(0); }
 
 HLE(IoFileMgrForUser, sceIoDopen) {
 	std::string g = gstr(ARG(0));
-	DIR *d = opendir(io_host_path(g).c_str());
-	if (!d) { LOGIO("dopen '%s' -> not found", g.c_str()); RET(SCE_ERROR_ERRNO_FILE_NOT_FOUND); return; }
+	std::vector<DirEntry> list;
+	bool ok = false;
+	if (umd_iso_path(g)) {
+		const IsoNode *n = umd_iso_node(g);
+		if (n && n->dir) {
+			ok = true;
+			std::string dev, rel;
+			split_guest(g, dev, rel);
+			for (const std::string &c : n->children) {
+				const IsoNode *ch = iso_find(rel + "/" + c);
+				if (ch) list.push_back({c, ch->dir, ch->size, ch->mtime});
+			}
+		}
+	} else {
+		std::error_code ec;
+		fs::path dir = u8p(io_host_path(g));
+		if (fs::is_directory(dir, ec)) {
+			ok = true;
+			for (fs::directory_iterator it(dir, ec), e; !ec && it != e; it.increment(ec)) {
+				DirEntry d;
+				d.name = u8s(it->path().filename());
+				d.dir = it->is_directory(ec);
+				d.size = d.dir ? 0 : (u64)it->file_size(ec);
+				auto ft = it->last_write_time(ec);
+				d.mtime = std::chrono::system_clock::to_time_t(
+				    std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+				        ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
+				list.push_back(d);
+			}
+		}
+	}
+	if (!ok) { LOGIO("dopen '%s' -> not found", g.c_str()); RET(SCE_ERROR_ERRNO_FILE_NOT_FOUND); return; }
 	int fd = s_next_fd++;
-	s_files[fd].d = d;
+	s_files[fd].isDir = true;
+	s_files[fd].entries = std::move(list);
 	s_files[fd].path = g;
 	RET(fd);
 }
@@ -240,7 +424,7 @@ HLE(IoFileMgrForUser, sceIoDopen) {
 // ScePspDateTime: year, month, day, hour, minute, second (u16 each), microsecond (u32)
 static void put_psp_time(u32 a, time_t t) {
 	struct tm tmv;
-	localtime_r(&t, &tmv);
+	platform_localtime(t, &tmv);
 	u16 v[6] = {(u16)(tmv.tm_year + 1900), (u16)(tmv.tm_mon + 1), (u16)tmv.tm_mday, (u16)tmv.tm_hour, (u16)tmv.tm_min, (u16)tmv.tm_sec};
 	memcpy(gptr(a), v, 12);
 	SW(a + 12, 0);
@@ -248,38 +432,35 @@ static void put_psp_time(u32 a, time_t t) {
 
 HLE(IoFileMgrForUser, sceIoDread) {
 	auto it = s_files.find((int)ARG(0));
-	if (it == s_files.end() || !it->second.d) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
-	dirent *e;
-	do { e = readdir(it->second.d); } while (e && (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")));
-	if (!e) { RET(0); return; }
+	if (it == s_files.end() || !it->second.isDir) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
+	OpenFile &of = it->second;
+	if (of.dirPos >= of.entries.size()) { RET(0); return; }
+	const DirEntry &e = of.entries[of.dirPos++];
 	u32 p = ARG(1);
 	// SceIoDirent: SceIoStat (mode, attr, size64, ctime, atime, mtime, private[6]) + name[256] + d_private
 	memset(gptr(p), 0, 0x58 + 256);
-	struct stat st{};
-	std::string full = io_host_path(it->second.path) + "/" + e->d_name;
-	stat(full.c_str(), &st);
-	bool dir = S_ISDIR(st.st_mode) || e->d_type == DT_DIR;
-	SW(p + 0, dir ? 0x11FF : 0x21FF);
-	SW(p + 4, dir ? 0x10 : 0x20);
-	SW(p + 8, (u32)st.st_size);
-	SW(p + 12, (u32)((u64)st.st_size >> 32));
-	put_psp_time(p + 16, st.st_ctime);
-	put_psp_time(p + 32, st.st_atime);
-	put_psp_time(p + 48, st.st_mtime);
-	strncpy((char *)gptr(p + 0x58), e->d_name, 255);
+	SW(p + 0, e.dir ? 0x11FF : 0x21FF);
+	SW(p + 4, e.dir ? 0x10 : 0x20);
+	SW(p + 8, (u32)e.size);
+	SW(p + 12, (u32)(e.size >> 32));
+	put_psp_time(p + 16, e.mtime);
+	put_psp_time(p + 32, e.mtime);
+	put_psp_time(p + 48, e.mtime);
+	strncpy((char *)gptr(p + 0x58), e.name.c_str(), 255);
 	RET(1);
 }
 
 HLE(IoFileMgrForUser, sceIoDclose) {
 	auto it = s_files.find((int)ARG(0));
-	if (it == s_files.end() || !it->second.d) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
-	closedir(it->second.d);
+	if (it == s_files.end() || !it->second.isDir) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
 	s_files.erase(it);
 	RET(0);
 }
 
 HLE(IoFileMgrForUser, sceIoRename) {
-	RET(rename(io_host_path(gstr(ARG(0))).c_str(), io_host_path(gstr(ARG(1))).c_str()) == 0 ? 0 : SCE_ERROR_ERRNO_FILE_NOT_FOUND);
+	std::error_code ec;
+	fs::rename(u8p(io_host_path(gstr(ARG(0)))), u8p(io_host_path(gstr(ARG(1)))), ec);
+	RET(ec ? SCE_ERROR_ERRNO_FILE_NOT_FOUND : 0);
 }
 
 HLE(IoFileMgrForUser, sceIoDevctl) {

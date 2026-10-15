@@ -1,10 +1,7 @@
 // Memory, logging, indirect-call dispatch and the HLE import registry.
-#include <sys/mman.h>
-#include <unistd.h>
 #include <array>
 #include <atomic>
 #include <thread>
-#include <pthread.h>
 #include <chrono>
 #include <utility>
 #include <cstdlib>
@@ -17,6 +14,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "platform.h"
 
 u8 *g_mem;
 CPUState *currentMIPS;
@@ -62,20 +60,25 @@ void rt_log_error(const char *fmt, ...) {
 	va_end(ap);
 }
 
-// Microseconds since start. On this machine the kernel clocksource is HPET
-// (the TSC is not synchronised across cores), which makes every clock_gettime
-// a syscall. A ticker thread publishes the time every ~100 us instead, so
-// rt_time_us() is a plain atomic load (resolution 0.1 ms).
+// Microseconds since start. On Linux machines whose clocksource is HPET (the
+// TSC not synchronised across cores) every clock_gettime is a syscall, so a
+// ticker thread publishes the time every ~100 us instead and rt_time_us() is a
+// plain atomic load (resolution 0.1 ms). Windows' QueryPerformanceCounter is
+// cheap, and its sleeps are too coarse for a ticker, so it reads the clock.
 static u64 steady_us() {
 	static auto t0 = std::chrono::steady_clock::now();
 	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
+#ifdef _WIN32
+static struct ClockStart { ClockStart() { steady_us(); } } s_clock_start;
+u64 rt_time_us() { return std::max<u64>(steady_us(), 1); }
+#else
 static std::atomic<u64> s_now_us;
 static struct Ticker {
 	Ticker() {
 		steady_us();
 		std::thread([] {
-			pthread_setname_np(pthread_self(), "ticker");
+			platform_set_thread_name("ticker");
 			while (true) {
 				s_now_us.store(steady_us(), std::memory_order_relaxed);
 				std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -84,6 +87,7 @@ static struct Ticker {
 	}
 } s_ticker;
 u64 rt_time_us() { return std::max<u64>(s_now_us.load(std::memory_order_relaxed), 1); }
+#endif
 
 std::string gstr(u32 a) {
 	if (!a || !gvalid(a)) return "(null)";
@@ -94,9 +98,9 @@ std::string gstr(u32 a) {
 // ---------------------------------------------------------------- memory
 void memory_init() {
 	// Reserve the whole 512 MB guest window; pages are committed lazily by the OS.
-	void *p = mmap(nullptr, 0x20000000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-	if (p == MAP_FAILED) {
-		perror("mmap guest memory");
+	void *p = platform_alloc_lazy(0x20000000);
+	if (!p) {
+		fprintf(stderr, "cannot reserve 512 MB of guest memory\n");
 		exit(1);
 	}
 	g_mem = (u8 *)p;

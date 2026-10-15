@@ -15,3 +15,4 @@ extracted.part/
 ssx.ini
 *.log
 shot_*.ppm
+dist/

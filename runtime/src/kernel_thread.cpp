@@ -1,10 +1,7 @@
 // Threads, scheduling, waits, semaphores, FPLs, callbacks, alarms.
-// Each guest thread runs on its own host fiber (ucontext) with its own CPUState.
+// Each guest thread runs on its own host fiber (platform.h) with its own CPUState.
 // Only one guest thread runs at a time; switches happen inside HLE calls, like
 // the PSP's cooperative-at-syscall priority scheduler (interrupts run between).
-#include <sys/mman.h>
-#include <ucontext.h>
-#include <unistd.h>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -15,6 +12,7 @@
 #include <vector>
 
 #include "kernel.h"
+#include "platform.h"
 
 static u32 VBLANK_US = 16683;   // 59.94 Hz; 120 Hz when the game runs above 60
 void kernel_set_vblank_hz(double hz) { VBLANK_US = (u32)(1e6 / hz); }
@@ -48,8 +46,7 @@ struct Thread {
 	u32 wakeupCount = 0;
 	u32 exitStatus = 0x800201A4;
 	CPUState ctx;
-	ucontext_t uc;
-	void *hostStack = nullptr;
+	Fiber *fiber = nullptr;
 	u32 argSize = 0, argPtr = 0;
 	bool pendingCallbacks = false;
 };
@@ -58,11 +55,11 @@ static const size_t HOST_STACK = 4 << 20;
 static std::map<int, std::unique_ptr<Thread>> s_threads;
 static std::map<int, Callback> s_callbacks;
 static Thread *s_cur;
-static ucontext_t s_sched_uc;
+static Fiber *s_sched_fiber;
 static int s_next_uid = 0x100;
 static u64 s_ready_seq;
 static bool s_exit;
-static std::vector<void *> s_dead_stacks;
+static std::vector<Fiber *> s_dead_fibers;
 
 std::map<int, std::pair<std::string, std::pair<int, int>>> s_semas_dump();
 
@@ -151,7 +148,7 @@ static Thread *pick_next() {
 // Switch from the current fiber back to the scheduler.
 static void switch_to_scheduler() {
 	Thread *t = s_cur;
-	swapcontext(&t->uc, &s_sched_uc);
+	fiber_switch(t->fiber, s_sched_fiber);
 	// resumed
 	s_cur = t;
 	currentMIPS = &t->ctx;
@@ -347,15 +344,11 @@ static void reset_context(Thread *t) {
 	c.fcr31 = 0x00000E00;
 }
 
+// (Re)start a thread from its entry point on a fresh fiber. The old one (if the
+// thread ran before) is dormant, so it can go at once.
 static void start_fiber(Thread *t) {
-	if (!t->hostStack) {
-		t->hostStack = mmap(nullptr, HOST_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-	}
-	getcontext(&t->uc);
-	t->uc.uc_stack.ss_sp = t->hostStack;
-	t->uc.uc_stack.ss_size = HOST_STACK;
-	t->uc.uc_link = &s_sched_uc;
-	makecontext(&t->uc, fiber_main, 0);
+	fiber_destroy(t->fiber);
+	t->fiber = fiber_create(fiber_main, HOST_STACK);
 }
 
 int kernel_create_thread(const std::string &name, u32 entry, int prio, u32 stackSize, u32 attr) {
@@ -407,8 +400,8 @@ void kernel_exit_current_thread(u32 code) {
 	t->status = Thread::DORMANT;
 	t->wait = WAIT_NONE;
 	kernel_wake_where(WAIT_THREADEND, t->id, code);
-	setcontext(&s_sched_uc);  // never returns; fiber is restarted from scratch on StartThread
-	__builtin_unreachable();
+	fiber_switch(t->fiber, s_sched_fiber);  // never resumed; StartThread makes a new fiber
+	abort();
 }
 
 // ------------------------------------------------------------- callbacks
@@ -465,10 +458,11 @@ void kernel_init() {
 static u64 s_idle_since;
 u64 g_prof_guest, g_prof_ge, g_prof_flush;
 void kernel_run() {
+	s_sched_fiber = fiber_init_thread();
 	while (!s_exit) {
 		process_timers();
-		for (void *s : s_dead_stacks) munmap(s, HOST_STACK);
-		s_dead_stacks.clear();
+		for (Fiber *f : s_dead_fibers) fiber_destroy(f);
+		s_dead_fibers.clear();
 		Thread *t = pick_next();
 		if (!t) {
 			display_pump_events();
@@ -494,7 +488,7 @@ void kernel_run() {
 		t->status = Thread::RUNNING;
 		update_next_due();
 		u64 t0 = rt_time_us();
-		swapcontext(&s_sched_uc, &t->uc);
+		fiber_switch(s_sched_fiber, t->fiber);
 		g_prof_guest += rt_time_us() - t0;
 		s_cur = nullptr;
 	}
@@ -530,7 +524,7 @@ static int terminate(int id, bool del) {
 	t->exitStatus = 0x800201AC;
 	kernel_wake_where(WAIT_THREADEND, t->id, t->exitStatus);
 	if (del) {
-		if (t->hostStack) s_dead_stacks.push_back(t->hostStack);
+		if (t->fiber) s_dead_fibers.push_back(t->fiber);
 		kernel_free(t->stackAddr);
 		s_threads.erase(t->id);
 	}
@@ -544,7 +538,7 @@ HLE(ThreadManForUser, sceKernelDeleteThread) {
 	Thread *t = get_thread((int)ARG(0));
 	if (!t) { RET(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
 	if (t->status != Thread::DORMANT) { RET(SCE_KERNEL_ERROR_NOT_DORMANT); return; }
-	if (t->hostStack) s_dead_stacks.push_back(t->hostStack);
+	if (t->fiber) s_dead_fibers.push_back(t->fiber);
 	kernel_free(t->stackAddr);
 	s_threads.erase(t->id);
 	RET(0);

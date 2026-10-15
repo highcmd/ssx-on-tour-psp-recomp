@@ -3,6 +3,13 @@
 This page covers the full process, from your UMD to a running game. For a short version, see the
 [README](../README.md).
 
+The game code is generated from your own dump, so nobody can hand you a ready-made `ssx.exe`: every
+player builds it once, which takes a minute or two. You can build for:
+
+- **Linux x86-64:** natively (sections 1–4).
+- **Windows x64:** natively with only Python installed, or cross-compiled from Linux/WSL
+  ([Windows](#windows-x64)).
+
 ## 1. Install the dependencies
 
 The build needs:
@@ -82,6 +89,8 @@ The setup takes about a minute on a modern 8-core CPU. It prints each step:
 |---|---|
 | `--no-build` | stop after generating `build/gen/`, for example to build with your own CMake flags |
 | `--force` | extract again and redo the analysis, even if the results are already there |
+| `--target linux\|windows` | what to build; the default is the system you run it on ([Windows](#windows-x64)) |
+| `--extract-all` | unpack the whole UMD to `extracted/`, only needed to run with `--umd extracted` |
 | `-j N` | number of parallel compile jobs (default: Ninja's choice) |
 
 Running `./setup.sh` again is safe. Finished steps are skipped, and the recompiler and the build only
@@ -94,15 +103,18 @@ All of these come from your dump, and all of them are in `.gitignore`. Never com
 | Path | Contents |
 |---|---|
 | `iso/` | the image (unpacked from the zip, or a symlink to your `.iso`) |
-| `extracted/` | the UMD file system; the game reads it as `disc0:` / `umd0:` |
+| `extracted/` | `BOOT.BIN` and two small headers for the recompiler |
 | `data/functions.json` | function boundaries and jump tables found in `BOOT.BIN` |
 | `build/gen/` | the recompiled C++ (`recomp_*.cpp`) and the initial memory image `image.bin` |
-| `build/cmake/ssx` | the executable |
-| `run/` | runtime working directory: saves, `ssx.ini`, `ssx.log` |
+| `build/cmake/ssx` | the Linux executable |
+| `build/win64/`, `dist/ssx-windows-x64/` | the Windows build and the ready-to-run folder |
+| `third_party/win64/` | the downloaded Windows compiler and libraries |
+| `run/` | runtime working directory on Linux: saves, `ssx.ini`, `ssx.log` |
 
-The executable has absolute paths to `extracted/`, `build/gen/image.bin`, the ISO and
-`runtime/assets/` built in. If you move the checkout or the ISO, run `./setup.sh` again, or pass the
-paths explicitly (see [OPTIONS.md](OPTIONS.md#paths)).
+At run time the game reads its files straight from the ISO; nothing else is unpacked. The Linux
+executable has absolute paths to `build/gen/image.bin`, the ISO and `runtime/assets/` built in. If
+you move the checkout or the ISO, run `./setup.sh` again, or pass the paths explicitly (see
+[OPTIONS.md](OPTIONS.md#paths)).
 
 ## 4. Play
 
@@ -116,6 +128,46 @@ All the options are described in [OPTIONS.md](OPTIONS.md).
 
 To quit, close the window or press Ctrl+C in the terminal. The game exits immediately; it saves on
 its own after races and in the menus, as on the PSP.
+
+## Windows x64
+
+The Windows build is a self-contained folder, `dist/ssx-windows-x64/`. It holds `ssx.exe`, the SDL2
+and FFmpeg DLLs, `image.bin` and `assets/`, and it needs nothing installed to run. The toolchain
+([llvm-mingw](https://github.com/mstorsjo/llvm-mingw): clang + lld for Windows) and the
+libraries ([SDL2](https://github.com/libsdl-org/SDL) mingw package,
+[FFmpeg](https://github.com/BtbN/FFmpeg-Builds) win64 shared build) are downloaded on first use into
+`third_party/win64/` (about 300 MB). The llvm-mingw and SDL2 archives are checked against pinned
+SHA-256 hashes.
+
+### On Windows
+
+1. Install [Python 3.10 or newer](https://www.python.org/downloads/). During installation, tick
+   "Add python.exe to PATH" or keep the `py` launcher. Nothing else is needed: the setup installs
+   CMake and Ninja into its own venv and downloads the compiler.
+2. Get the source: `git clone https://github.com/highcmd/ssx-on-tour-psp-recomp.git`, or
+   download the ZIP from GitHub and unpack it.
+3. In that folder, run:
+
+   ```bat
+   setup.bat D:\Games\ssx-on-tour.iso
+   ```
+
+4. Start `dist\ssx-windows-x64\ssx.exe`. The setup writes the ISO location into `ssx.ini` there.
+   You can move the whole `ssx-windows-x64` folder anywhere you like.
+
+### Cross-compiling from Linux or WSL
+
+```sh
+./setup.sh /path/to/ssx-on-tour.iso --target windows
+```
+
+Then copy `dist/ssx-windows-x64/` to the Windows machine. Put your `.iso` into that folder next to
+`ssx.exe`, or set `iso = D:\Games\ssx-on-tour.iso` in `ssx.ini` there. From WSL, the folder
+is reachable at `\\wsl$\<distro>\<path>`; copy it to a Windows drive before playing.
+
+The Windows build is compiled for any x86-64 CPU; `-march=native` is turned off so the folder works
+on other PCs. It needs Windows 10 or newer and an OpenGL 3.3 driver (all current AMD, Intel and NVIDIA
+drivers).
 
 ## Building by hand
 
@@ -144,6 +196,8 @@ to keep the build time reasonable; the GE renderer (`ge_render.cpp`) is built wi
 | `Run tools/recomp.py first` from CMake | `build/gen/` is missing; run `./setup.sh <dump>` |
 | `cannot load …/image.bin` | the checkout moved; rerun `./setup.sh` or pass `--image` |
 | black window, `OpenGL` errors in the log | driver without GL 3.3 core; try `--renderer software` |
+| Windows: `No UMD image found` | put the `.iso` next to `ssx.exe` or set `iso = …` in `ssx.ini` next to it |
+| Windows: SmartScreen warns about `ssx.exe` | the file is unsigned because you built it yourself; choose "More info → Run anyway" |
 | no sound | check that SDL sees an audio device (`SDL_AUDIODRIVER=pulseaudio ./run.sh`, or `pipewire`/`alsa`) |
 | pad not detected | see [OPTIONS.md → Gamepads](OPTIONS.md#gamepads) |
 | something else | run from a terminal and look at `run/ssx.log`; open an issue with its tail |
