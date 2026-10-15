@@ -1,0 +1,65 @@
+// SSX On Tour — statically recompiled PSP game, native runtime entry point.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <csignal>
+#include <string>
+#include <unistd.h>
+
+#include "kernel.h"
+
+void rt_log_init();
+void memory_init();
+bool memory_load_image(const char *path);
+void dispatch_init();
+void display_init(bool headless);
+void kernel_reserve_image();
+extern std::string g_umd_root, g_ms_root, g_assetDir, g_iso_path;
+
+static void usage() {
+	fprintf(stderr,
+	        "usage: ssx [--umd <extracted UMD dir>] [--image <image.bin>] [--iso <umd.iso>] [--assets <dir>] [--headless]\n"
+	        "  keys: arrows=d-pad, Z=cross X=circle A=square S=triangle Q/E=L/R Enter=start Backspace=select IJKL=analog\n");
+}
+
+static void on_term(int) {
+	rt_log(LOG_RT, "SIGTERM: thread dump");
+	kernel_dump_threads();
+	_exit(3);
+}
+
+int main(int argc, char **argv) {
+	signal(SIGTERM, on_term);
+	std::string image = SSX_DEFAULT_IMAGE;
+	bool headless = false;
+	g_umd_root = SSX_DEFAULT_UMD;
+	g_assetDir = SSX_DEFAULT_ASSETS;
+	g_iso_path = SSX_DEFAULT_ISO;
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i];
+		auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(1); } return argv[++i]; };
+		if (a == "--umd") g_umd_root = next();
+		else if (a == "--image") image = next();
+		else if (a == "--iso") g_iso_path = next();
+		else if (a == "--assets") g_assetDir = next();
+		else if (a == "--ms") g_ms_root = next();
+		else if (a == "--headless") headless = true;
+		else { usage(); return a == "--help" ? 0 : 1; }
+	}
+
+	rt_log_init();
+	memory_init();
+	if (!memory_load_image(image.c_str())) {
+		fprintf(stderr, "cannot load %s\n", image.c_str());
+		return 1;
+	}
+	dispatch_init();
+	hle_init_imports();
+	kernel_reserve_image();
+	display_init(headless);
+	kernel_init();
+	kernel_start_module(g_image_entry);
+	kernel_run();
+	rt_log(LOG_RT, "exit");
+	return 0;
+}

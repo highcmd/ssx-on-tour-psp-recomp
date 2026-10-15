@@ -1,0 +1,12 @@
+*.zip
+*.iso
+iso/
+extracted/
+third_party/
+build/
+.venv/
+__pycache__/
+data/functions.json
+run/
+data/imports.txt
+.claude/
