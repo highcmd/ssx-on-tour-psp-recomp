@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
+#include <ctime>
 #include <cstring>
 #include <map>
 #include <string>
@@ -236,6 +237,15 @@ HLE(IoFileMgrForUser, sceIoDopen) {
 	RET(fd);
 }
 
+// ScePspDateTime: year, month, day, hour, minute, second (u16 each), microsecond (u32)
+static void put_psp_time(u32 a, time_t t) {
+	struct tm tmv;
+	localtime_r(&t, &tmv);
+	u16 v[6] = {(u16)(tmv.tm_year + 1900), (u16)(tmv.tm_mon + 1), (u16)tmv.tm_mday, (u16)tmv.tm_hour, (u16)tmv.tm_min, (u16)tmv.tm_sec};
+	memcpy(gptr(a), v, 12);
+	SW(a + 12, 0);
+}
+
 HLE(IoFileMgrForUser, sceIoDread) {
 	auto it = s_files.find((int)ARG(0));
 	if (it == s_files.end() || !it->second.d) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
@@ -243,10 +253,19 @@ HLE(IoFileMgrForUser, sceIoDread) {
 	do { e = readdir(it->second.d); } while (e && (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")));
 	if (!e) { RET(0); return; }
 	u32 p = ARG(1);
-	// SceIoDirent: SceIoStat (0x58 bytes: mode, attr, size64, ctime[16], atime[16], mtime[16], private[6*4]) + name[256]
+	// SceIoDirent: SceIoStat (mode, attr, size64, ctime, atime, mtime, private[6]) + name[256] + d_private
 	memset(gptr(p), 0, 0x58 + 256);
-	SW(p + 0, e->d_type == DT_DIR ? 0x11FF : 0x21FF);
-	SW(p + 4, e->d_type == DT_DIR ? 0x10 : 0x20);
+	struct stat st{};
+	std::string full = io_host_path(it->second.path) + "/" + e->d_name;
+	stat(full.c_str(), &st);
+	bool dir = S_ISDIR(st.st_mode) || e->d_type == DT_DIR;
+	SW(p + 0, dir ? 0x11FF : 0x21FF);
+	SW(p + 4, dir ? 0x10 : 0x20);
+	SW(p + 8, (u32)st.st_size);
+	SW(p + 12, (u32)((u64)st.st_size >> 32));
+	put_psp_time(p + 16, st.st_ctime);
+	put_psp_time(p + 32, st.st_atime);
+	put_psp_time(p + 48, st.st_mtime);
 	strncpy((char *)gptr(p + 0x58), e->d_name, 255);
 	RET(1);
 }
