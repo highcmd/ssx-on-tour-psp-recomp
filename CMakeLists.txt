@@ -43,6 +43,8 @@ if(NOT EXISTS ${GEN_DIR}/sources.txt)
   message(FATAL_ERROR "Run tools/recomp.py first (build/gen is missing)")
 endif()
 file(STRINGS ${GEN_DIR}/sources.txt GEN_SOURCES_REL)
+# Re-run this configuration when the recompiler writes a different set of files.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GEN_DIR}/sources.txt)
 list(TRANSFORM GEN_SOURCES_REL PREPEND ${GEN_DIR}/ OUTPUT_VARIABLE GEN_SOURCES)
 
 # Recompiled game code: huge, goto-heavy functions. -O1 keeps build times sane;

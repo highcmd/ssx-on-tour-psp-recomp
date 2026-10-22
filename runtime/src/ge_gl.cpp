@@ -396,14 +396,20 @@ int gl_target_width() { return TW; }
 bool gl_find_color_target(u32 addr, u32 *base, u32 *stride, u32 *fmt) {
 	std::lock_guard<std::mutex> lk(g_tmtx);
 	addr &= 0x0FFFFFFF;
+	// Targets are 512 rows tall, so a double-buffered pair (B right below A's 272
+	// visible rows) overlaps: prefer the target starting closest below addr.
+	const ColorTarget *best = nullptr;
+	u32 bestBase = 0;
 	for (auto &[b, t] : g_color) {
 		u32 bytes = t.stride * (t.fmt == 3 ? 4 : 2) * 512;
-		if (t.tex && addr >= b && addr < b + bytes) {
-			*base = b; *stride = t.stride; *fmt = t.fmt;
-			return true;
+		if (t.tex && addr >= b && addr < b + bytes && (!best || b > bestBase)) {
+			best = &t;
+			bestBase = b;
 		}
 	}
-	return false;
+	if (!best) return false;
+	*base = bestBase; *stride = best->stride; *fmt = best->fmt;
+	return true;
 }
 
 bool gl_has_color_target(u32 addr) {

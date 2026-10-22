@@ -456,6 +456,8 @@ class Recompiler:
 
     def run(self):
         OUT.mkdir(parents=True, exist_ok=True)
+        for old in OUT.glob("recomp_[0-9]*.cpp"):   # a previous run may have made more files
+            old.unlink()
         unhandled = []
         files = []
         for k in range(0, len(self.funcs), FUNCS_PER_FILE):
