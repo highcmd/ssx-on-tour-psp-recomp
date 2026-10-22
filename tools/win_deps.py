@@ -8,7 +8,8 @@ build) and on Windows (native build): only the compiler download differs.
   SDL2        mingw development package                   (github.com/libsdl-org/SDL)
   FFmpeg      win64 shared build, GPL                     (github.com/BtbN/FFmpeg-Builds)
 
-The first two are pinned releases checked by SHA-256. FFmpeg comes from the
+On a Windows host without CMake/Ninja on PATH (the packaged launcher), those
+are fetched too. All but FFmpeg are pinned releases checked by SHA-256. FFmpeg comes from the
 "latest" build of the 8.1 release branch, which is rebuilt over time, so it is
 checked by layout only.
 """
@@ -29,35 +30,60 @@ PKGS = {
     "sdl2": (
         f"{GH}/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-devel-2.32.10-mingw.zip",
         "f15cff5fca62ec9381a016ef1d42a95c638cd72d2f226ba5781c76fe43dbd1ac"),
+    "cmake-windows": (
+        f"{GH}/Kitware/CMake/releases/download/v4.3.5/cmake-4.3.5-windows-x86_64.zip",
+        "c05a60d22d5df22d75a72ae9b6628ef5f20daee4f4ba380920e1fbbeaf244fc1"),
+    "ninja-windows": (
+        f"{GH}/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+        "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65"),
     "ffmpeg": (
         f"{GH}/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip",
         None),
 }
 
 
+def log(msg):
+    print(msg, flush=True)
+
+
+class DepsError(Exception):
+    pass
+
+
+def die(msg):
+    raise DepsError(msg)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def fetch(name):
     url, sha = PKGS[name]
     DEST.mkdir(parents=True, exist_ok=True)
     out = DEST / url.rsplit("/", 1)[1]
-    if out.exists() and (sha is None or hashlib.sha256(out.read_bytes()).hexdigest() == sha):
+    if out.exists() and (sha is None or sha256(out) == sha):
         return out
-    print(f"==> downloading {url}", flush=True)
+    log(f"==> downloading {url}")
     tmp = out.with_suffix(out.suffix + ".part")
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
-        done = 0
+        done = step = 0
         while chunk := r.read(1 << 20):
             f.write(chunk)
             done += len(chunk)
-            if total and sys.stdout.isatty():
-                print(f"\r    {done >> 20}/{total >> 20} MiB", end="", flush=True)
-        if total and sys.stdout.isatty():
-            print()
+            if total and done * 10 // total > step:
+                step = done * 10 // total
+                log(f"    {done >> 20}/{total >> 20} MiB")
     if sha:
-        got = hashlib.sha256(tmp.read_bytes()).hexdigest()
+        got = sha256(tmp)
         if got != sha:
             tmp.unlink()
-            sys.exit(f"error: {out.name}: SHA-256 {got}, expected {sha}")
+            die(f"{out.name}: SHA-256 {got}, expected {sha}")
     tmp.rename(out)
     return out
 
@@ -67,7 +93,7 @@ def unpack(archive, marker):
     target = DEST / marker
     if target.exists():
         return target
-    print(f"==> unpacking {archive.name}", flush=True)
+    log(f"==> unpacking {archive.name}")
     if archive.name.endswith(".zip"):
         with zipfile.ZipFile(archive) as z:
             z.extractall(DEST)
@@ -80,15 +106,15 @@ def unpack(archive, marker):
         with tarfile.open(archive) as t:
             t.extractall(DEST, filter="tar") if hasattr(tarfile, "data_filter") else t.extractall(DEST)
     if not target.exists():
-        sys.exit(f"error: {archive.name} did not contain {marker}")
+        die(f"{archive.name} did not contain {marker}")
     return target
 
 
 def ensure():
-    """Return dict with the toolchain root, SDL2 prefix and FFmpeg root."""
+    """Return dict with the toolchain root, SDL2 prefix, FFmpeg root and tool paths."""
     host = "windows" if platform.system() == "Windows" else "linux"
     if host == "linux" and platform.machine() not in ("x86_64", "AMD64"):
-        sys.exit("error: the Windows cross build needs an x86-64 Linux host")
+        die("the Windows cross build needs an x86-64 Linux host")
     llvm_dir = (f"llvm-mingw-{LLVM_MINGW_VER}-ucrt-ubuntu-22.04-x86_64" if host == "linux"
                 else f"llvm-mingw-{LLVM_MINGW_VER}-ucrt-x86_64")
     llvm = unpack(fetch(f"llvm-mingw-{host}"), llvm_dir)
@@ -96,10 +122,24 @@ def ensure():
     ffm = unpack(fetch("ffmpeg"), "ffmpeg-n8.1-latest-win64-gpl-shared-8.1")
     for need in (ffm / "include/libavcodec/avcodec.h", ffm / "bin", sdl / "bin/SDL2.dll"):
         if not need.exists():
-            sys.exit(f"error: unexpected package layout, {need} is missing")
-    return {"llvm": llvm, "sdl2": sdl, "ffmpeg": ffm}
+            die(f"unexpected package layout, {need} is missing")
+    tools = {}
+    if host == "windows":
+        if not shutil.which("cmake"):
+            tools["cmake"] = str(unpack(fetch("cmake-windows"), "cmake-4.3.5-windows-x86_64") / "bin/cmake.exe")
+        if not shutil.which("ninja"):
+            nz = fetch("ninja-windows")
+            ndir = DEST / "ninja-1.13.2"
+            if not (ndir / "ninja.exe").exists():
+                with zipfile.ZipFile(nz) as z:
+                    z.extractall(ndir)
+            tools["ninja"] = str(ndir / "ninja.exe")
+    return {"llvm": llvm, "sdl2": sdl, "ffmpeg": ffm, "tools": tools}
 
 
 if __name__ == "__main__":
-    for k, v in ensure().items():
-        print(f"{k}: {v}")
+    try:
+        for k, v in ensure().items():
+            print(f"{k}: {v}")
+    except DepsError as e:
+        sys.exit(f"error: {e}")

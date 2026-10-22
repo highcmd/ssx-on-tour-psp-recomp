@@ -228,44 +228,85 @@ static u32 scripted_buttons() {
 	return b;
 }
 
+// ------------------------------------------------------------- input bindings
+// PSP inputs that can be bound; "analog_*" are keyboard stand-ins for the nub.
+struct PspInput { const char *name; u32 bit; const char *keys; const char *pad; };
+static const PspInput s_inputs[] = {
+	{"up", 0x10, "Up", "dpup"},          {"down", 0x40, "Down", "dpdown"},
+	{"left", 0x80, "Left", "dpleft"},    {"right", 0x20, "Right", "dpright"},
+	{"cross", 0x4000, "Z", "a"},         {"circle", 0x2000, "X", "b"},
+	{"square", 0x8000, "A", "x"},        {"triangle", 0x1000, "S", "y"},
+	{"l", 0x100, "Q", "leftshoulder,lefttrigger"},
+	{"r", 0x200, "E", "rightshoulder,righttrigger"},
+	{"start", 0x8, "Return", "start"},   {"select", 0x1, "Backspace,Right Shift", "back"},
+	{"analog_up", 0, "I", ""},           {"analog_down", 0, "K", ""},
+	{"analog_left", 0, "J", ""},         {"analog_right", 0, "L", ""},
+};
+enum { AN_UP = 1 << 0, AN_DOWN = 1 << 1, AN_LEFT = 1 << 2, AN_RIGHT = 1 << 3 };
+struct KeyBind { SDL_Scancode sc; u32 bit; u32 analog; };
+struct PadBind { int button; int axis; u32 bit; };   // button or trigger axis (-1 = unused)
+static std::vector<KeyBind> s_keyBinds;
+static std::vector<PadBind> s_padBinds;
+
+static std::vector<std::string> split_list(const std::string &v) {
+	std::vector<std::string> out;
+	size_t i = 0;
+	while (i <= v.size()) {
+		size_t j = v.find(',', i);
+		if (j == std::string::npos) j = v.size();
+		std::string t = v.substr(i, j - i);
+		size_t a = t.find_first_not_of(" \t"), z = t.find_last_not_of(" \t");
+		if (a != std::string::npos && t.substr(a, z - a + 1) != "none") out.push_back(t.substr(a, z - a + 1));
+		i = j + 1;
+	}
+	return out;
+}
+
+static void build_bindings() {
+	s_keyBinds.clear();
+	s_padBinds.clear();
+	const auto &cfg = g_settings.bindings;
+	for (int i = 0; i < (int)(sizeof(s_inputs) / sizeof(s_inputs[0])); i++) {
+		const PspInput &in = s_inputs[i];
+		u32 analog = i >= 12 ? 1u << (i - 12) : 0;
+		auto k = cfg.find(std::string("key_") + in.name);
+		for (const std::string &n : split_list(k != cfg.end() ? k->second : in.keys)) {
+			SDL_Scancode sc = SDL_GetScancodeFromName(n.c_str());
+			if (sc == SDL_SCANCODE_UNKNOWN) rt_log_error("ssx.ini key_%s: unknown key '%s'", in.name, n.c_str());
+			else s_keyBinds.push_back({sc, in.bit, analog});
+		}
+		if (analog) continue;
+		auto pd = cfg.find(std::string("pad_") + in.name);
+		for (const std::string &n : split_list(pd != cfg.end() ? pd->second : in.pad)) {
+			if (n == "lefttrigger") { s_padBinds.push_back({-1, SDL_CONTROLLER_AXIS_TRIGGERLEFT, in.bit}); continue; }
+			if (n == "righttrigger") { s_padBinds.push_back({-1, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, in.bit}); continue; }
+			SDL_GameControllerButton b = SDL_GameControllerGetButtonFromString(n.c_str());
+			if (b == SDL_CONTROLLER_BUTTON_INVALID) rt_log_error("ssx.ini pad_%s: unknown button '%s'", in.name, n.c_str());
+			else s_padBinds.push_back({b, -1, in.bit});
+		}
+	}
+}
+
 static void update_buttons() {
 	if (s_headless) { s_buttons = scripted_buttons(); return; }
+	static bool bound;
+	if (!bound) { build_bindings(); bound = true; }
 	const Uint8 *k = SDL_GetKeyboardState(nullptr);
-	u32 b = scripted_buttons();
-	if (k[SDL_SCANCODE_UP]) b |= 0x10;
-	if (k[SDL_SCANCODE_RIGHT]) b |= 0x20;
-	if (k[SDL_SCANCODE_DOWN]) b |= 0x40;
-	if (k[SDL_SCANCODE_LEFT]) b |= 0x80;
-	if (k[SDL_SCANCODE_RETURN]) b |= 0x8;        // start
-	if (k[SDL_SCANCODE_BACKSPACE] || k[SDL_SCANCODE_RSHIFT]) b |= 0x1;  // select
-	if (k[SDL_SCANCODE_Q]) b |= 0x100;           // L
-	if (k[SDL_SCANCODE_E]) b |= 0x200;           // R
-	if (k[SDL_SCANCODE_S]) b |= 0x1000;          // triangle
-	if (k[SDL_SCANCODE_X]) b |= 0x2000;          // circle
-	if (k[SDL_SCANCODE_Z]) b |= 0x4000;          // cross
-	if (k[SDL_SCANCODE_A]) b |= 0x8000;          // square
+	u32 b = scripted_buttons(), analog = 0;
+	for (const KeyBind &kb : s_keyBinds)
+		if (k[kb.sc]) { b |= kb.bit; analog |= kb.analog; }
 	int lx = 128, ly = 128;
-	if (k[SDL_SCANCODE_J]) lx = 0;
-	if (k[SDL_SCANCODE_L]) lx = 255;
-	if (k[SDL_SCANCODE_I]) ly = 0;
-	if (k[SDL_SCANCODE_K]) ly = 255;
+	if (analog & AN_LEFT) lx = 0;
+	if (analog & AN_RIGHT) lx = 255;
+	if (analog & AN_UP) ly = 0;
+	if (analog & AN_DOWN) ly = 255;
 	const int dz = g_settings.deadzone;
 	for (SDL_GameController *pad : s_pads) {
-		auto btn = [&](SDL_GameControllerButton sb, u32 pb) { if (SDL_GameControllerGetButton(pad, sb)) b |= pb; };
-		btn(SDL_CONTROLLER_BUTTON_DPAD_UP, 0x10);
-		btn(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x20);
-		btn(SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x40);
-		btn(SDL_CONTROLLER_BUTTON_DPAD_LEFT, 0x80);
-		btn(SDL_CONTROLLER_BUTTON_START, 0x8);
-		btn(SDL_CONTROLLER_BUTTON_BACK, 0x1);
-		btn(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 0x100);
-		btn(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 0x200);
-		btn(SDL_CONTROLLER_BUTTON_Y, 0x1000);
-		btn(SDL_CONTROLLER_BUTTON_B, 0x2000);
-		btn(SDL_CONTROLLER_BUTTON_A, 0x4000);
-		btn(SDL_CONTROLLER_BUTTON_X, 0x8000);
-		if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) b |= 0x100;
-		if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) b |= 0x200;
+		for (const PadBind &pb : s_padBinds) {
+			bool on = pb.button >= 0 ? SDL_GameControllerGetButton(pad, (SDL_GameControllerButton)pb.button)
+			                         : SDL_GameControllerGetAxis(pad, (SDL_GameControllerAxis)pb.axis) > 16000;
+			if (on) b |= pb.bit;
+		}
 		// left stick -> PSP analog nub, rescaled outside the deadzone
 		auto axis = [&](SDL_GameControllerAxis a) {
 			int v = SDL_GameControllerGetAxis(pad, a);

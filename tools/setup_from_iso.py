@@ -26,12 +26,24 @@ GAME_ID = b"ULUS-10042"
 BOOT_SHA1 = "74d1360e3111283fe937185ef23fa8d901bb0085"   # PSP_GAME/SYSDIR/BOOT.BIN
 
 
+class SetupError(Exception):
+    pass
+
+
+def _print(msg):
+    print(msg, flush=True)
+
+
+# Where progress goes; the launcher replaces it with its log window.
+log = _print
+
+
 def die(msg):
-    sys.exit(f"error: {msg}")
+    raise SetupError(msg)
 
 
 def step(msg):
-    print(f"==> {msg}", flush=True)
+    log(f"==> {msg}")
 
 
 # --- ISO 9660 ------------------------------------------------------------
@@ -40,9 +52,13 @@ class Iso:
     def __init__(self, path):
         self.path = path
         self.f = open(path, "rb")
+        if os.path.getsize(path) < 17 * SECTOR:
+            self.f.close()
+            die(f"{path} is not a UMD/ISO image")
         pvd = self.read(16 * SECTOR, SECTOR)
         if pvd[0] != 1 or pvd[1:6] != b"CD001":
-            die(f"{path} is not an ISO 9660 image")
+            self.f.close()
+            die(f"{path} is not a UMD/ISO image")
         self.root = self._record(pvd, 156)
 
     def read(self, off, size):
@@ -138,6 +154,11 @@ def obtain_iso(src):
             return dst
     if src.parent == isodir:
         return src
+    probe = Iso(src)            # check it before linking it into iso/
+    try:
+        verify(probe)
+    finally:
+        probe.f.close()
     link = isodir / src.name
     if link.is_symlink() or link.exists():
         if link.resolve() != src:
@@ -164,7 +185,7 @@ def verify(iso):
         die(f"BOOT.BIN has SHA-1 {sha}, expected {BOOT_SHA1}.\n"
             "       The image is a different revision or modified; only the retail "
             "ULUS-10042 release is supported.")
-    print(f"    {GAME_ID.decode()}, BOOT.BIN {sha[:12]}… OK")
+    log(f"    {GAME_ID.decode()}, BOOT.BIN {sha[:12]}… OK")
 
 
 # The runtime reads the game straight from the ISO; the recompiler only needs these.
@@ -199,14 +220,57 @@ def extract(iso, force, everything):
         total += rec["size"]
     (tmp / stamp.name).write_text(BOOT_SHA1 + "\n")
     tmp.rename(out)
-    print(f"    {n} files, {total >> 20} MiB")
+    log(f"    {n} files, {total >> 20} MiB")
 
 
-def run(cmd, **kw):
-    print("    $ " + " ".join(str(c) for c in cmd), flush=True)
-    r = subprocess.run([str(c) for c in cmd], **kw)
-    if r.returncode:
-        die(f"command failed with exit code {r.returncode}")
+FROZEN = getattr(sys, "frozen", False)   # inside the packaged launcher
+
+
+def run(cmd):
+    """Run a command, passing its output to log() line by line."""
+    log("    $ " + " ".join(str(c) for c in cmd))
+    flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW: no console flashing up
+    p = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, creationflags=flags)
+    for line in iter(p.stdout.readline, b""):
+        log("    " + line.decode("utf-8", "replace").rstrip())
+    if p.wait():
+        die(f"command failed with exit code {p.returncode}")
+
+
+class _LogWriter:
+    def __init__(self):
+        self.buf = ""
+
+    def write(self, s):
+        self.buf += s
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            log("    " + line)
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+def run_tool(script):
+    """Run one of tools/*.py: a child Python normally, in-process in the launcher."""
+    if not FROZEN:
+        run([sys.executable, script])
+        return
+    import contextlib, runpy
+    log(f"    $ {script.name}")
+    old_argv, old_path = sys.argv, list(sys.path)
+    sys.argv = [str(script)]
+    sys.path.insert(0, str(script.parent))
+    try:
+        with contextlib.redirect_stdout(_LogWriter()):
+            runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            die(f"{script.name} failed: {e.code}")
+    finally:
+        sys.argv, sys.path[:] = old_argv, old_path
 
 
 def recompile(force):
@@ -215,19 +279,23 @@ def recompile(force):
     except ImportError:
         die("the Python package 'rabbitizer' is missing; run ./setup.sh, "
             "or: pip install -r requirements.txt")
-    py = sys.executable
     funcs = ROOT / "data/functions.json"
     if force or not funcs.exists():
         step("analysing BOOT.BIN (function discovery)")
-        run([py, ROOT / "tools/analyze.py"])
+        run_tool(ROOT / "tools/analyze.py")
     else:
         step("data/functions.json is up to date")
     step("recompiling MIPS to C++ (build/gen)")
-    run([py, ROOT / "tools/recomp.py"])
+    run_tool(ROOT / "tools/recomp.py")
+
+
+_tools = {}
 
 
 def tool(name):
-    """Find a build tool on PATH or next to this Python (pip-installed cmake/ninja)."""
+    """Find a build tool: downloaded (Windows), on PATH, or next to this Python (pip cmake/ninja)."""
+    if name in _tools:
+        return _tools[name]
     here = pathlib.Path(sys.executable).parent
     found = shutil.which(name) or shutil.which(name, path=str(here))
     if not found:
@@ -245,6 +313,7 @@ def build(iso_path, jobs):
          f"-DSSX_ISO={iso_path.resolve()}"])
     run([tool("ninja"), "-C", bdir, "ssx"] + (["-j", str(jobs)] if jobs else []))
     step("done. Start the game with ./run.sh (options: ./run.sh --help)")
+    return {"exe": bdir / "ssx", "cwd": ROOT / "run"}
 
 
 WINDOWS_README = """SSX On Tour - native Windows build (static recompilation)
@@ -264,17 +333,27 @@ zlib-licensed and FFmpeg is GPL (see licenses\\).
 """
 
 
+def cm(path):
+    """A path for a CMake -D argument: forward slashes (backslashes are escapes in CMake)."""
+    return pathlib.Path(path).as_posix()
+
+
 def build_windows(iso_path, jobs):
     import win_deps
-    deps = win_deps.ensure()
+    win_deps.log = log
+    try:
+        deps = win_deps.ensure()
+    except win_deps.DepsError as e:
+        die(str(e))
+    _tools.update(deps.get("tools", {}))
     step("configuring and building for Windows x64")
     bdir = ROOT / "build/win64"
-    run([tool("cmake"), "-S", ROOT, "-B", bdir, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}",
+    run([tool("cmake"), "-S", ROOT, "-B", bdir, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={cm(tool('ninja'))}",
          "-DCMAKE_BUILD_TYPE=Release",
-         f"-DCMAKE_TOOLCHAIN_FILE={ROOT / 'cmake/llvm-mingw.cmake'}",
-         f"-DLLVM_MINGW={deps['llvm']}",
-         f"-DCMAKE_PREFIX_PATH={deps['sdl2']}",
-         f"-DSSX_FFMPEG_ROOT={deps['ffmpeg']}",
+         f"-DCMAKE_TOOLCHAIN_FILE={cm(ROOT / 'cmake/llvm-mingw.cmake')}",
+         f"-DLLVM_MINGW={cm(deps['llvm'])}",
+         f"-DCMAKE_PREFIX_PATH={cm(deps['sdl2'])}",
+         f"-DSSX_FFMPEG_ROOT={cm(deps['ffmpeg'])}",
          "-DSSX_NATIVE_ARCH=OFF"])
     run([tool("ninja"), "-C", bdir, "ssx"] + (["-j", str(jobs)] if jobs else []))
 
@@ -298,21 +377,45 @@ def build_windows(iso_path, jobs):
         shutil.copy2(sdl_lic, lic / "SDL2-LICENSE.txt")
     (dist / "README.txt").write_bytes(WINDOWS_README.replace("\n", "\r\n").encode())
     ini = dist / "ssx.ini"
-    if platform.system() == "Windows" and not ini.exists():
-        ini.write_text(f"iso = {iso_path.resolve()}\n")
+    text = ini.read_text(encoding="utf-8") if ini.exists() else ""
+    has_iso = any(l.split("#")[0].split("=")[0].strip() == "iso" for l in text.splitlines())
+    if platform.system() == "Windows" and not has_iso:
+        ini.write_text(text + ("" if text.endswith("\n") or not text else "\n") + f"iso = {iso_path.resolve()}\n",
+                       encoding="utf-8")
+        has_iso = True
+    if has_iso or any(dist.glob("*.iso")):
         where = "ssx.ini points at your ISO"
-    elif any(dist.glob("*.iso")) or (ini.exists() and "iso" in ini.read_text()):
-        where = "the ISO is already set up"
     else:
         where = f"copy your ISO ({iso_path.name}) into that folder, or set 'iso = <path>' in ssx.ini there"
     step(f"done: {dist}\n    {where}, then start ssx.exe")
+    return {"exe": dist / "ssx.exe", "cwd": dist}
+
+
+def default_target():
+    return "windows" if platform.system() == "Windows" else "linux"
+
+
+def setup(image, target=None, build_it=True, force=False, extract_all=False, jobs=0):
+    """The whole pipeline. Returns {"exe", "cwd"} of the built game (None with build_it=False)."""
+    iso_path = obtain_iso(pathlib.Path(image))
+    iso = Iso(iso_path)
+    try:
+        verify(iso)
+        extract(iso, force, extract_all)
+    finally:
+        iso.f.close()
+    recompile(force)
+    if not build_it:
+        return None
+    if (target or default_target()) == "windows":
+        return build_windows(iso_path, jobs)
+    return build(iso_path, jobs)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("image", type=pathlib.Path, help="your SSX On Tour USA dump (.iso or .zip)")
-    ap.add_argument("--target", choices=["linux", "windows"],
-                    default="windows" if platform.system() == "Windows" else "linux",
+    ap.add_argument("--target", choices=["linux", "windows"], default=default_target(),
                     help="what to build (default: this system); windows works from Linux/WSL too")
     ap.add_argument("--no-build", action="store_true", help="stop after generating build/gen")
     ap.add_argument("--force", action="store_true", help="redo extraction and analysis")
@@ -320,18 +423,10 @@ def main():
                     help="extract the whole UMD (only needed to run with --umd <dir> instead of the ISO)")
     ap.add_argument("-j", "--jobs", type=int, default=0, help="parallel compile jobs")
     a = ap.parse_args()
-
-    iso_path = obtain_iso(a.image)
-    iso = Iso(iso_path)
-    verify(iso)
-    extract(iso, a.force, a.extract_all)
-    recompile(a.force)
-    if a.no_build:
-        return
-    if a.target == "windows":
-        build_windows(iso_path, a.jobs)
-    else:
-        build(iso_path, a.jobs)
+    try:
+        setup(a.image, a.target, not a.no_build, a.force, a.extract_all, a.jobs)
+    except SetupError as e:
+        sys.exit(f"error: {e}")
 
 
 if __name__ == "__main__":

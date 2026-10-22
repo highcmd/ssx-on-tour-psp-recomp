@@ -111,6 +111,19 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
   `cmake/llvm-mingw.cmake`); `SSX_PORTABLE`: image.bin/assets next to the exe, which is also the cwd.
   `setup --target windows` assembles `dist/ssx-windows-x64`. Verified under Wine 11 (boot → race, saves, pad).
 
+## Launcher (2026-10-22)
+- `launcher/ssx_launcher.py` (tkinter + sv-ttk): Game tab runs `setup_from_iso.setup()` in a thread (log via
+  `setup_from_iso.log`), Display/Controls tabs write ssx.ini, PLAY starts the game. Packaged with PyInstaller
+  (`launcher/ssx_launcher.spec`): one exe with Python, rabbitizer and the source tree (git ls-files, no game
+  data), unpacked to %LOCALAPPDATA%\SSX-Recomp\workspace when its content hash changes. In the packaged app
+  analyze.py/recomp.py run in-process (runpy); on Windows CMake/Ninja are downloaded (win_deps).
+- `--build <iso> --quit-after-build` / `--self-test` for automation and CI (.github/workflows/launcher.yml
+  builds SSXLauncher.exe on windows-latest and attaches it to published releases).
+- Input bindings: `key_<btn>` / `pad_<btn>` in ssx.ini (SDL scancode / controller button names), parsed in
+  hle_display.cpp build_bindings().
+- Verified under Wine 11: the packaged launcher downloads llvm-mingw/CMake/Ninja, recompiles and builds
+  ssx.exe natively (Windows-hosted toolchain), and the result boots. Caught: CMake -D paths need '/'.
+
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never
 committed (see .gitignore).

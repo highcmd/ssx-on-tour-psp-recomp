@@ -14,17 +14,19 @@ this output is tracked by git (see `.gitignore`), so please don't commit it, upl
 You need **SSX On Tour, USA release (`ULUS-10042`)** dumped to an `.iso` from your own UMD with a PSP
 running custom firmware.
 
-### Windows
+### Windows: the launcher
 
-1. Install [Python 3.10+](https://www.python.org/downloads/). That is the only prerequisite: the setup
-   downloads the compiler and the libraries itself.
-2. Download this repository (Code → Download ZIP, or `git clone`) and, in its folder, run:
+1. Download **`SSXLauncher.exe`** from the [latest release](https://github.com/highcmd/ssx-on-tour-psp-recomp/releases/latest)
+   and start it. Nothing needs to be installed.
+2. Click **Choose ISO…** and select your dump. The launcher checks it, downloads the compiler and
+   libraries (about 300 MB, once), and builds the game in a few minutes.
+3. Set the resolution, frame rate and controls in the **Display** and **Controls** tabs, then press **PLAY**.
 
-   ```bat
-   setup.bat D:\Games\ssx-on-tour.iso
-   ```
+The launcher contains no game data; the game is built on your PC from your copy. Everything is kept
+in `%LOCALAPPDATA%\SSX-Recomp` (the Game tab has buttons to open the game and saves folders).
 
-3. Start `dist\ssx-windows-x64\ssx.exe`.
+Without the launcher, the same works from the command line: install Python 3.10+, download this
+repository, run `setup.bat D:\Games\ssx-on-tour.iso` and start `dist\ssx-windows-x64\ssx.exe`.
 
 ### Linux
 
@@ -42,7 +44,7 @@ running custom firmware.
    ./setup.sh /path/to/your/ssx-on-tour.iso      # a .zip holding the .iso also works
    ```
 
-3. Play:
+3. Play, with the graphical launcher (`./launcher.sh`, needs `python3-tk`) or directly:
 
    ```sh
    ./run.sh                                       # 960×544 window, original 30 fps
@@ -69,6 +71,7 @@ the game into C++ and builds it. At run time the game reads its files straight f
   (`--render-scale 1..6`), not an upscaled 480×272 image
 - 30 (original), 60 or 120 fps in races, with physics and race timing kept correct
 - Linux and Windows x64 builds
+- A launcher with settings for resolution, frame rate and controls (remappable keys and pad buttons)
 - Xbox-style gamepads (hot-plug) and the keyboard
 - ATRAC3+ music, PSMF/H.264 movies, saves on a virtual memory stick
 - Not done yet: sound effects (SAS), saves that work on a real PSP, the system dialog UI, network play

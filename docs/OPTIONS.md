@@ -1,5 +1,9 @@
 # Options and configuration
 
+The easiest way to change settings is the **launcher** (`SSXLauncher.exe` on Windows, `./launcher.sh`
+on Linux): its Display and Controls tabs write `ssx.ini` for you. This page describes the file
+and the command-line flags behind it.
+
 You can set options in two places:
 
 1. **`ssx.ini`**: the configuration file. On Linux it is read from the directory the game starts
@@ -27,6 +31,8 @@ In `ssx.ini`, write `key = value`, one per line; `#` starts a comment. On the co
 | `right_stick_dpad` | `--right-stick-dpad` | `true`/`false` | `false` | the right stick also works as the D-pad (menus) |
 | `pad_mapping` | `--pad-mapping STR` | SDL mapping line | none | adds a mapping for a pad SDL doesn't know, see [Gamepads](#gamepads) |
 | `iso` | `--iso FILE` | path | see [Paths](#paths) | your UMD image |
+| `key_<button>` | none | key names | see [Remapping](#remapping) | keyboard keys for a PSP button |
+| `pad_<button>` | none | button names | see [Remapping](#remapping) | gamepad buttons for a PSP button |
 
 In `ssx.ini`, booleans accept `true`/`1`/`on`/`yes`; anything else counts as false.
 
@@ -96,6 +102,34 @@ Tested with a wired Xbox 360 pad.
 | none | none | F11 = toggle fullscreen |
 
 Keyboard and pads can be used at the same time.
+
+### Remapping
+
+Every PSP button can be bound to other keys and pad buttons in `ssx.ini`, or in the launcher's
+Controls tab. Separate several bindings with commas; `none` removes all of them.
+
+```ini
+key_cross = Space, Z
+key_select = none
+pad_l = leftshoulder
+pad_r = rightshoulder, righttrigger
+```
+
+| PSP button | `ssx.ini` names |
+|---|---|
+| D-pad | `up`, `down`, `left`, `right` |
+| ✕ ○ □ △ | `cross`, `circle`, `square`, `triangle` |
+| shoulders, Start, Select | `l`, `r`, `start`, `select` |
+| analog nub, keyboard only | `analog_up`, `analog_down`, `analog_left`, `analog_right` |
+
+- **Keys** use SDL's key names: `A`–`Z`, `0`–`9`, `Return`, `Space`, `Backspace`, `Tab`,
+  `Left Shift`, `Right Shift`, `Left Ctrl`, `Right Ctrl`, `Left Alt`, `Right Alt`, `Up`, `Down`, `Left`,
+  `Right`, `Keypad 0`–`Keypad 9`, `Keypad Enter`, `F1`–`F12`, and so on. Letters refer to the key's
+  position on a US layout.
+- **Pad buttons** use SDL's game controller names: `a`, `b`, `x`, `y`, `leftshoulder`, `rightshoulder`,
+  `lefttrigger`, `righttrigger`, `back`, `start`, `guide`, `leftstick`, `rightstick`, `dpup`, `dpdown`,
+  `dpleft`, `dpright`.
+- The left stick is always the analog nub. Unknown names are reported in `ssx.log`.
 
 If your pad isn't recognised (nothing happens, or the buttons are mixed up), create a mapping line
 with a tool such as the SDL2 Gamepad Tool or

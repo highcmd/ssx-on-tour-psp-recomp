@@ -44,6 +44,7 @@ static bool apply_setting(const std::string &k, const std::string &v) {
 	else if (k == "right_stick_dpad") s.rightStickAsDpad = parse_bool(v);
 	else if (k == "pad_mapping") s.padMapping = v;
 	else if (k == "iso") s.isoPath = v;
+	else if (k.rfind("key_", 0) == 0 || k.rfind("pad_", 0) == 0) s.bindings[k] = v;
 	else return false;
 	return true;
 }

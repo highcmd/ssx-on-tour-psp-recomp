@@ -1,5 +1,6 @@
 #pragma once
 // User settings: ssx.ini (key = value) in the working directory, overridden by CLI flags.
+#include <map>
 #include <string>
 
 struct Settings {
@@ -15,6 +16,9 @@ struct Settings {
 	bool rightStickAsDpad = false;
 	std::string padMapping;    // optional SDL_GameControllerDB line
 	std::string isoPath;       // UMD image (ssx.ini 'iso'; --iso on the command line)
+	// Input bindings: "key_cross" -> "Z" (SDL scancode names), "pad_cross" -> "a" (SDL
+	// game controller button names, plus lefttrigger/righttrigger). Comma = several.
+	std::map<std::string, std::string> bindings;
 };
 
 extern Settings g_settings;

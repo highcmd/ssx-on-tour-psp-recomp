@@ -1,0 +1,40 @@
+# Builds SSXLauncher.exe (launcher + Python + source tree, no game data) and attaches
+# it to the release that triggered the run. Manual runs keep it as a workflow artifact.
+name: Windows launcher
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller and the launcher's packages
+        run: pip install -r launcher/requirements.txt
+      - name: Build SSXLauncher.exe
+        run: pyinstaller --noconfirm launcher/ssx_launcher.spec
+      - name: Smoke test (the pipeline modules import inside the bundle)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/SSXLauncher.exe -ArgumentList "--self-test" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SSXLauncher-windows-x64
+          path: dist/SSXLauncher.exe
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/SSXLauncher.exe --clobber

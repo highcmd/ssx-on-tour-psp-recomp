@@ -140,7 +140,23 @@ libraries ([SDL2](https://github.com/libsdl-org/SDL) mingw package,
 `third_party/win64/` (about 300 MB). The llvm-mingw and SDL2 archives are checked against pinned
 SHA-256 hashes.
 
-### On Windows
+### With the launcher
+
+`SSXLauncher.exe` (in the [releases](https://github.com/highcmd/ssx-on-tour-psp-recomp/releases)) is
+a single file holding the launcher, a Python runtime and this repository's source, without any game
+data. **Choose ISO…** runs the same steps as `setup.bat` in `%LOCALAPPDATA%\SSX-Recomp\workspace`,
+and the game ends up in `workspace\dist\ssx-windows-x64`. The log of the last build is shown in
+the Game tab. For automation, run `SSXLauncher.exe --build <iso> --quit-after-build`; it writes
+`last-build.log` to the same folder.
+
+To build the launcher yourself: `pip install -r launcher/requirements.txt`, then
+`pyinstaller launcher/ssx_launcher.spec` (on Windows). The release workflow
+(`.github/workflows/launcher.yml`) does this on every published release.
+
+Windows Defender sometimes flags PyInstaller-packed programs. If it does, the build log and the
+source are public: report it as a false positive, or use `setup.bat` instead.
+
+### On Windows without the launcher
 
 1. Install [Python 3.10 or newer](https://www.python.org/downloads/). During installation, tick
    "Add python.exe to PATH" or keep the `py` launcher. Nothing else is needed: the setup installs
