@@ -9,11 +9,12 @@ Run from a source checkout (python3 launcher/ssx_launcher.py) it works in the
 checkout. Packaged (PyInstaller, see ssx_launcher.spec) it carries the source
 tree and works in a per-user folder (%LOCALAPPDATA%\\SSX-Recomp on Windows).
 """
-import json, locale, os, pathlib, platform, queue, shutil, subprocess, sys, threading, traceback
+import json, os, pathlib, platform, queue, shutil, subprocess, sys, threading, traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
+BUILD_VERSION = "0.2.1"   # bump when runtime/ or tools/ change, so packaged users rebuild the game
 FROZEN = getattr(sys, "frozen", False)
 IS_WIN = os.name == "nt"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -94,19 +95,8 @@ TEXT = {
 }
 
 
-def detect_lang():
-    try:
-        if IS_WIN:
-            import ctypes
-            code = locale.windows_locale.get(ctypes.windll.kernel32.GetUserDefaultUILanguage(), "")
-        else:
-            code = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or ""
-        return "pl" if code.lower().startswith("pl") else "en"
-    except Exception:
-        return "en"
-
-
-L = TEXT[detect_lang()]
+LANGS = {"en": "English", "pl": "Polski"}
+L = TEXT["en"]   # English unless the user picks another language (saved in launcher.json)
 
 # ----------------------------------------------------------------- inputs
 
@@ -327,6 +317,7 @@ class Launcher:
         self.busy = False
         self.game = None
         self.state = self.load_state()
+        self.set_lang(self.state.get("lang", "en"))
         self.mon = monitor_info(root)
 
         root.title(L["title"])
@@ -341,6 +332,31 @@ class Launcher:
         self.quit_after = quit_after
         if build_iso:
             root.after(300, lambda: self.start_build(build_iso))
+
+    # --- language
+    def set_lang(self, code):
+        global L
+        self.lang = code if code in TEXT else "en"
+        L = TEXT[self.lang]
+
+    def change_lang(self):
+        code = next(k for k, v in LANGS.items() if v == self.lang_var.get())
+        if code == self.lang:
+            return
+        self.save_settings()
+        self.state["lang"] = code
+        self.save_state()
+        log, tab = self.log.get("1.0", "end-1c"), self.nb.index("current")
+        self.set_lang(code)
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.title(L["title"])
+        self.build_ui()
+        self.nb.select(tab)
+        self.load_settings()
+        if log:
+            self.append_log(log.rstrip("\n"))
+        self.refresh_status()
 
     # --- state
     def load_state(self):
@@ -361,7 +377,7 @@ class Launcher:
         if not FROZEN:   # a checkout is rebuilt by the developer (setup.sh) when sources change
             return False
         try:
-            return self.p.built_stamp.read_text().strip() != APP_VERSION
+            return self.p.built_stamp.read_text().strip() != BUILD_VERSION
         except OSError:
             return True
 
@@ -384,7 +400,13 @@ class Launcher:
         ttk.Label(top, text="SSX On Tour", style="Title.TLabel").pack(side="left")
         ttk.Label(top, text=f"  PC · v{APP_VERSION}").pack(side="left", pady=(8, 0))
 
-        nb = ttk.Notebook(r)
+        self.lang_var = tk.StringVar(value=LANGS[self.lang])
+        self.lang_cb = ttk.Combobox(top, textvariable=self.lang_var, values=list(LANGS.values()),
+                                    state="readonly", width=10)
+        self.lang_cb.pack(side="right", pady=(6, 0))
+        self.lang_cb.bind("<<ComboboxSelected>>", lambda e: self.change_lang())
+
+        self.nb = nb = ttk.Notebook(r)
         nb.pack(fill="both", expand=True, padx=16, pady=8)
         self.tab_game(nb)
         self.tab_display(nb)
@@ -676,6 +698,7 @@ class Launcher:
                                 text=L["running"] if self.game else L["play"])
         for b in (self.choose_btn,):
             b.configure(state="disabled" if self.busy else "normal")
+        self.lang_cb.configure(state="disabled" if self.busy else "readonly")
         self.rebuild_btn.configure(state="normal" if self.state.get("iso") and not self.busy else "disabled")
 
     # --- log
@@ -759,7 +782,7 @@ class Launcher:
             self.save_state()
             self.iso_var.set(self.state["iso"])
             self.p.built_stamp.parent.mkdir(parents=True, exist_ok=True)
-            self.p.built_stamp.write_text(APP_VERSION)
+            self.p.built_stamp.write_text(BUILD_VERSION)
             self.save_settings()
             self.append_log("")
             self.append_log(L["done"])
