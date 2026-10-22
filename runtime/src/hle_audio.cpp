@@ -85,7 +85,7 @@ struct AudioChan {
 	s64 next = 0;          // timeline frame where the next buffer starts
 	int lvol = 0x8000, rvol = 0x8000;
 };
-static AudioChan s_chans[8];
+static AudioChan s_chans[9];   // 8 = the Output2 (SRC) channel
 
 HLE(sceAudio, sceAudioChReserve) {
 	int ch = (int)ARG(0);
@@ -112,7 +112,7 @@ HLE(sceAudio, sceAudioChangeChannelVolume) {
 
 // A blocking output returns once at most one buffer is queued ahead of playback.
 static void audio_output(CPUState *c, u32 ch, int lvol, int rvol, u32 buf, bool blocking) {
-	if (ch >= 8 || !s_chans[ch].reserved) { RET(0x80260008); return; }
+	if (ch >= 9 || !s_chans[ch].reserved) { RET(0x80260008); return; }
 	AudioChan &a = s_chans[ch];
 	s64 n = a.samples;
 	s64 now = now_frame();
@@ -125,7 +125,7 @@ static void audio_output(CPUState *c, u32 ch, int lvol, int rvol, u32 buf, bool 
 	if (buf && gvalid(buf)) mix_at(a.next, (const int16_t *)gptr(buf), (int)n, a.fmt == 0, lvol, rvol);
 	static bool dump = getenv("SSX_AUDIO_DUMP") != nullptr;
 	if (dump && buf && gvalid(buf)) {   // raw s16 per channel: ch<N>.raw
-		static FILE *files[8];
+		static FILE *files[9];
 		if (!files[ch]) { char nm[32]; snprintf(nm, sizeof(nm), "ch%u.raw", ch); files[ch] = fopen(nm, "wb"); }
 		fwrite(gptr(buf), 1, (size_t)n * (a.fmt == 0 ? 4 : 2), files[ch]);
 	}
@@ -135,6 +135,24 @@ static void audio_output(CPUState *c, u32 ch, int lvol, int rvol, u32 buf, bool 
 HLE(sceAudio, sceAudioOutputBlocking) { audio_output(c, ARG(0), ARG(1), ARG(1), ARG(2), true); }
 HLE(sceAudio, sceAudioOutputPannedBlocking) { audio_output(c, ARG(0), ARG(1), ARG(2), ARG(3), true); }
 HLE(sceAudio, sceAudioOutputPanned) { audio_output(c, ARG(0), ARG(1), ARG(2), ARG(3), false); }
+// Output2: one extra stereo 44.1 kHz channel with a single volume (sceAudioOutput2*).
+static const u32 OUT2 = 8;
+HLE(sceAudio, sceAudioOutput2Reserve) {
+	if (s_chans[OUT2].reserved) { RET(0x80260002); return; }
+	s_chans[OUT2] = AudioChan{};
+	s_chans[OUT2].reserved = true;
+	s_chans[OUT2].samples = ARG(0);
+	rt_log(LOG_AUDIO, "Output2Reserve(%u)", ARG(0));
+	RET(0);
+}
+HLE(sceAudio, sceAudioOutput2Release) { s_chans[OUT2].reserved = false; RET(0); }
+HLE(sceAudio, sceAudioOutput2ChangeLength) { s_chans[OUT2].samples = ARG(0); RET(0); }
+HLE(sceAudio, sceAudioOutput2OutputBlocking) { audio_output(c, OUT2, ARG(0), ARG(0), ARG(1), true); }
+HLE(sceAudio, sceAudioOutput2GetRestSample) {
+	s64 rest = s_chans[OUT2].next - (now_frame() + LATENCY);
+	RET(rest > 0 ? (u32)rest : 0);
+}
+
 HLE(sceAudio, sceAudioGetChannelRestLength) {
 	u32 ch = ARG(0);
 	if (ch >= 8) { RET(0x80260008); return; }
@@ -150,17 +168,25 @@ static const u32 ATRAC_ALL_DATA_DECODED = 0x80630024, ATRAC_BUFFER_IS_EMPTY = 0x
 struct Atrac {
 	bool used = false;
 	u32 bufAddr = 0, bufSize = 0;
-	std::vector<u8> file;          // received file bytes (file.size() = fileSize)
-	u32 fileSize = 0, received = 0;
+	std::vector<u8> file;          // file bytes as they arrive (file.size() = fileSize)
+	u32 fileSize = 0;
 	u32 dataOff = 0, dataSize = 0; // 'data' chunk
 	u32 blockAlign = 0, channels = 2;
 	u32 totalSamples = 0, sampleOffset = 0;  // from 'fact'
+	bool allLoaded = false;        // the whole file sits in the buffer: no streaming
+	u32 streamPos = 0;             // file offset of the next byte the game should add
+	u32 ringWrite = 0;             // where in the buffer it goes
+	u32 avail = 0;                 // streamed bytes not decoded yet
 	u32 readPos = 0;               // file offset of the next frame
-	s64 decodedSamples = 0;
+	u32 skip = 0;                  // samples to drop from the next decoded frame
+	s64 decodedSamples = 0;        // play position (samples)
+	u32 resetPos = 0;              // file offset GetBufferInfoForResetting asked for
 	int loopNum = 0;
 	bool at3plus = true;
 	AVCodecContext *dec = nullptr;
 	AVFrame *frame = nullptr;
+	u32 dataEnd() const { return dataOff + dataSize; }
+	u32 spf() const { return at3plus ? 2048 : 1024; }
 };
 static Atrac s_atrac[6];
 
@@ -177,7 +203,7 @@ static bool atrac_parse_header(Atrac &a, const u8 *d, u32 n) {
 	a.fileSize = rd32(4) + 8;
 	u32 o = 12;
 	while (o + 8 <= n) {
-		u32 id = rd32(o), sz = rd32(o + 4);
+		u32 sz = rd32(o + 4);
 		if (!memcmp(d + o, "fmt ", 4)) {
 			u32 tag = rd16(o + 8);
 			a.channels = rd16(o + 10);
@@ -192,7 +218,6 @@ static bool atrac_parse_header(Atrac &a, const u8 *d, u32 n) {
 			a.dataSize = sz;
 			break;
 		}
-		(void)id;
 		o += 8 + sz + (sz & 1);
 	}
 	if (!a.dataOff || !a.blockAlign) return false;
@@ -223,29 +248,39 @@ static Atrac *atrac_get(u32 id) {
 	return id < 6 && s_atrac[id].used ? &s_atrac[id] : nullptr;
 }
 
-HLE(sceAtrac3plus, sceAtracSetDataAndGetID) {
-	u32 buf = ARG(0), size = ARG(1);
+// Common to SetDataAndGetID / SetHalfwayBufferAndGetID: the buffer holds the first
+// `got` bytes of the file and is `size` bytes long.
+static void atrac_set_data(CPUState *c, u32 buf, u32 got, u32 size, const char *what) {
 	int id = -1;
 	for (int i = 0; i < 6; i++) if (!s_atrac[i].used) { id = i; break; }
 	if (id < 0) { RET(ATRAC_NO_ID); return; }
 	Atrac &a = s_atrac[id];
 	atrac_free(a);
-	if (!atrac_parse_header(a, gptr(buf), size) || !atrac_open_codec(a)) {
+	if (!atrac_parse_header(a, gptr(buf), got) || !atrac_open_codec(a)) {
 		atrac_free(a);
-		rt_log(LOG_AUDIO, "AtracSetDataAndGetID(%08x, %x): unknown format", buf, size);
+		rt_log(LOG_AUDIO, "%s(%08x, %x): unknown format", what, buf, got);
 		RET(ATRAC_UNKNOWN_FORMAT);
 		return;
 	}
 	a.used = true;
 	a.bufAddr = buf;
-	a.bufSize = size;
+	a.bufSize = std::max(size, got);
 	a.file.assign(a.fileSize, 0);
-	a.received = std::min(size, a.fileSize);
-	memcpy(a.file.data(), gptr(buf), a.received);
+	got = std::min(got, a.fileSize);
+	memcpy(a.file.data(), gptr(buf), got);
+	a.allLoaded = got >= a.fileSize;
+	a.streamPos = got;
+	a.ringWrite = got % a.bufSize;
 	a.readPos = a.dataOff;
-	rt_log(LOG_AUDIO, "AtracSetDataAndGetID(%08x, %x) -> %d: %s %u ch, frame %u B, file %u B, %u samples",
-	       buf, size, id, a.at3plus ? "ATRAC3+" : "ATRAC3", a.channels, a.blockAlign, a.fileSize, a.totalSamples);
+	a.avail = got > a.dataOff ? got - a.dataOff : 0;
+	a.skip = a.sampleOffset % a.spf();   // encoder delay
+	rt_log(LOG_AUDIO, "%s(%08x, %x/%x) -> %d: %s %u ch, frame %u B, file %u B, %u samples", what,
+	       buf, got, size, id, a.at3plus ? "ATRAC3+" : "ATRAC3", a.channels, a.blockAlign, a.fileSize, a.totalSamples);
 	RET(id);
+}
+HLE(sceAtrac3plus, sceAtracSetDataAndGetID) { atrac_set_data(c, ARG(0), ARG(1), ARG(1), "AtracSetDataAndGetID"); }
+HLE(sceAtrac3plus, sceAtracSetHalfwayBufferAndGetID) {
+	atrac_set_data(c, ARG(0), ARG(1), ARG(2), "AtracSetHalfwayBufferAndGetID");
 }
 
 HLE(sceAtrac3plus, sceAtracReleaseAtracID) {
@@ -255,16 +290,14 @@ HLE(sceAtrac3plus, sceAtracReleaseAtracID) {
 	RET(0);
 }
 
-// Stream ring: file offset x lives at bufAddr + (x % bufSize); the bytes still
-// needed are [readPos, received).
+// The buffer is a ring: the game adds file bytes at ringWrite (read from file offset
+// streamPos); decoding frees them. A looping stream continues at the data start.
 static void stream_info(const Atrac &a, u32 &writePtr, u32 &writable, u32 &readOffset) {
-	if (a.received >= a.fileSize) { writePtr = a.bufAddr; writable = 0; readOffset = 0; return; }
-	u32 ringPos = a.received % a.bufSize;
-	u32 used = a.received - std::min(a.readPos, a.received);
-	u32 freeBytes = a.bufSize > used ? a.bufSize - used : 0;
-	writable = std::min({freeBytes, a.bufSize - ringPos, a.fileSize - a.received});
-	writePtr = a.bufAddr + ringPos;
-	readOffset = a.received;
+	readOffset = a.streamPos;
+	writePtr = a.bufAddr + a.ringWrite;
+	if (a.allLoaded || a.streamPos >= a.dataEnd()) { writable = 0; return; }
+	u32 freeBytes = a.bufSize > a.avail ? a.bufSize - a.avail : 0;
+	writable = std::min({freeBytes, a.bufSize - a.ringWrite, a.dataEnd() - a.streamPos});
 }
 
 HLE(sceAtrac3plus, sceAtracGetStreamDataInfo) {
@@ -272,11 +305,20 @@ HLE(sceAtrac3plus, sceAtracGetStreamDataInfo) {
 	if (!a) { RET(ATRAC_BAD_ID); return; }
 	u32 wp, wb, ro;
 	stream_info(*a, wp, wb, ro);
-	static int n1; if (getenv("SSX_ATRACDBG") && n1++ < 40) rt_log(LOG_AUDIO, "GetStreamDataInfo -> wp %08x writable %x readOff %x (recv %x readPos %x)", wp, wb, ro, a->received, a->readPos);
+	static int n1; if (getenv("SSX_ATRACDBG") && n1++ < 40) rt_log(LOG_AUDIO, "GetStreamDataInfo -> wp %08x writable %x readOff %x (avail %x readPos %x)", wp, wb, ro, a->avail, a->readPos);
 	if (ARG(1)) SW(ARG(1), wp);
 	if (ARG(2)) SW(ARG(2), wb);
 	if (ARG(3)) SW(ARG(3), ro);
 	RET(0);
+}
+
+static void stream_add(Atrac &a, u32 from, u32 n) {
+	n = std::min(n, a.fileSize - std::min(a.streamPos, a.fileSize));
+	memcpy(a.file.data() + a.streamPos, gptr(from), n);
+	a.streamPos += n;
+	a.avail += n;
+	a.ringWrite = (a.ringWrite + n) % a.bufSize;
+	if (a.streamPos >= a.dataEnd() && a.loopNum != 0) a.streamPos = a.dataOff;
 }
 
 HLE(sceAtrac3plus, sceAtracAddStreamData) {
@@ -287,19 +329,88 @@ HLE(sceAtrac3plus, sceAtracAddStreamData) {
 	u32 n = ARG(1);
 	static int n2; if (getenv("SSX_ATRACDBG") && n2++ < 40) rt_log(LOG_AUDIO, "AddStreamData(%x) writable %x", n, wb);
 	if (n > wb) { RET(ATRAC_ADD_TOO_BIG); return; }
-	memcpy(a->file.data() + a->received, gptr(wp), n);
-	a->received += n;
-	if (getenv("SSX_ATRAC_DUMP") && a->received >= 0x8000 && a->received - n < 0x8000) {
-		FILE *f = fopen("atrac_file.bin", "wb");
-		fwrite(a->file.data(), 1, a->received, f);
-		fclose(f);
-	}
+	stream_add(*a, wp, n);
 	RET(0);
 }
 
 static int remain_frames(const Atrac &a) {
-	if (a.received >= a.fileSize) return -1;   // everything is loaded
-	return (int)((a.received - std::min(a.readPos, a.received)) / a.blockAlign);
+	if (a.allLoaded) return -1;   // everything is loaded
+	return (int)(a.avail / a.blockAlign);
+}
+
+// Seeking: the file offset of the frame holding `sample`, and how far into it.
+static u32 frame_of_sample(const Atrac &a, u32 sample, u32 &skip) {
+	u32 s = sample + a.sampleOffset;
+	skip = s % a.spf();
+	return a.dataOff + (s / a.spf()) * a.blockAlign;
+}
+
+// (id, sample, *info): where to put the file data for a seek. info = two
+// {writePtr, writableBytes, minWriteBytes, filePos} records; we use the first.
+HLE(sceAtrac3plus, sceAtracGetBufferInfoForResetting) {
+	Atrac *a = atrac_get(ARG(0));
+	if (!a) { RET(ATRAC_BAD_ID); return; }
+	u32 sample = ARG(1), info = ARG(2), skip;
+	if (sample > a->totalSamples) { RET(0x80630015); return; }   // ATRAC_BAD_SAMPLE
+	a->resetPos = frame_of_sample(*a, sample, skip);
+	if (info) {
+		bool all = a->allLoaded;
+		SW(info + 0, a->bufAddr);
+		SW(info + 4, all ? 0 : std::min(a->bufSize, a->fileSize - a->resetPos));
+		SW(info + 8, all ? 0 : a->blockAlign * 2);
+		SW(info + 12, all ? 0 : a->resetPos);
+		for (u32 k = 16; k < 32; k += 4) SW(info + k, 0);
+		if (!all) SW(info + 16, a->bufAddr);
+	}
+	RET(0);
+}
+
+// (id, sample, bytesWrittenFirst, bytesWrittenSecond)
+HLE(sceAtrac3plus, sceAtracResetPlayPosition) {
+	Atrac *a = atrac_get(ARG(0));
+	if (!a) { RET(ATRAC_BAD_ID); return; }
+	u32 sample = ARG(1), skip;
+	u32 pos = frame_of_sample(*a, sample, skip);
+	if (!a->allLoaded) {
+		a->streamPos = pos;
+		a->ringWrite = 0;
+		a->avail = 0;
+		stream_add(*a, a->bufAddr, ARG(2));
+	}
+	a->readPos = pos;
+	a->skip = skip;
+	a->decodedSamples = sample;
+	avcodec_flush_buffers(a->dec);
+	rt_log(LOG_AUDIO, "AtracResetPlayPosition(%u, sample %u, %x bytes) -> file %x", ARG(0), sample, ARG(2), pos);
+	RET(0);
+}
+
+HLE(sceAtrac3plus, sceAtracGetNextDecodePosition) {
+	Atrac *a = atrac_get(ARG(0));
+	if (!a) { RET(ATRAC_BAD_ID); return; }
+	if (a->decodedSamples >= a->totalSamples && a->loopNum == 0) { RET(ATRAC_ALL_DATA_DECODED); return; }
+	if (ARG(1)) SW(ARG(1), (u32)a->decodedSamples);
+	RET(0);
+}
+
+// (id, *endSample, *loopStart, *loopEnd): no loop points in the files we play
+HLE(sceAtrac3plus, sceAtracGetSoundSample) {
+	Atrac *a = atrac_get(ARG(0));
+	if (!a) { RET(ATRAC_BAD_ID); return; }
+	if (ARG(1)) SW(ARG(1), a->totalSamples ? a->totalSamples - 1 : 0);
+	if (ARG(2)) SW(ARG(2), 0xFFFFFFFF);
+	if (ARG(3)) SW(ARG(3), 0xFFFFFFFF);
+	RET(0);
+}
+
+// kbps, computed like the PSP (PPSSPP sceAtrac.cpp)
+HLE(sceAtrac3plus, sceAtracGetBitrate) {
+	Atrac *a = atrac_get(ARG(0));
+	if (!a) { RET(ATRAC_BAD_ID); return; }
+	u32 rate = a->blockAlign * 352800 / 1000;
+	rate = a->at3plus ? ((rate >> 11) + 8) & 0xFFFFFFF0 : (rate + 511) >> 10;
+	if (ARG(1)) SW(ARG(1), rate);
+	RET(0);
 }
 
 HLE(sceAtrac3plus, sceAtracDecodeData) {
@@ -312,20 +423,20 @@ HLE(sceAtrac3plus, sceAtracDecodeData) {
 		if (ARG(3)) SW(ARG(3), fin);
 		if (ARG(4)) SW(ARG(4), (u32)remain_frames(*a));
 	};
-	u32 end = a->dataOff + a->dataSize;
-	if (a->readPos + a->blockAlign > end) {
+	if (a->readPos + a->blockAlign > a->dataEnd()) {
 		if (a->loopNum != 0) {
 			if (a->loopNum > 0) a->loopNum--;
 			a->readPos = a->dataOff;
 			a->decodedSamples = 0;
+			a->skip = a->sampleOffset % a->spf();
 		} else {
 			finish(0, 1);
 			RET(ATRAC_ALL_DATA_DECODED);
 			return;
 		}
 	}
-	if (a->readPos + a->blockAlign > a->received) {
-		static int n4; if (getenv("SSX_ATRACDBG") && n4++ < 40) rt_log(LOG_AUDIO, "DecodeData: buffer empty readPos %x recv %x", a->readPos, a->received);
+	if (!a->allLoaded && a->avail < a->blockAlign) {
+		static int n4; if (getenv("SSX_ATRACDBG") && n4++ < 40) rt_log(LOG_AUDIO, "DecodeData: buffer empty readPos %x avail %x", a->readPos, a->avail);
 		finish(0, 0);
 		RET(ATRAC_BUFFER_IS_EMPTY);
 		return;
@@ -334,32 +445,27 @@ HLE(sceAtrac3plus, sceAtracDecodeData) {
 	pkt->data = a->file.data() + a->readPos;
 	pkt->size = (int)a->blockAlign;
 	a->readPos += a->blockAlign;
+	if (!a->allLoaded) a->avail -= a->blockAlign;
 	u32 samples = 0;
 	if (avcodec_send_packet(a->dec, pkt) == 0 && avcodec_receive_frame(a->dec, a->frame) == 0) {
 		samples = (u32)a->frame->nb_samples;
 		int ch = a->frame->ch_layout.nb_channels;
 		int16_t *dst = out && gvalid(out) ? (int16_t *)gptr(out) : nullptr;
-		for (u32 i = 0; dst && i < samples; i++)
+		u32 skip = std::min(a->skip, samples);
+		for (u32 i = skip; dst && i < samples; i++)
 			for (int k = 0; k < 2; k++) {
 				const float *src = (const float *)a->frame->extended_data[std::min(k, ch - 1)];
-				dst[2 * i + k] = (int16_t)std::clamp((int)lrintf(src[i] * 32767.0f), -32768, 32767);
+				dst[2 * (i - skip) + k] = (int16_t)std::clamp((int)lrintf(src[i] * 32767.0f), -32768, 32767);
 			}
+		samples -= skip;
+		a->skip = 0;
 	}
 	av_packet_free(&pkt);
-	// the encoder delay (fact sample offset) is skipped at the start
-	if (a->decodedSamples == 0 && a->sampleOffset && samples > a->sampleOffset % samples && out) {
-		u32 skip = a->sampleOffset % std::max<u32>(samples, 1);
-		if (skip) {
-			int16_t *dst = (int16_t *)gptr(out);
-			memmove(dst, dst + 2 * skip, (samples - skip) * 4);
-			samples -= skip;
-		}
-	}
 	a->decodedSamples += samples;
 	static FILE *dec = getenv("SSX_ATRAC_DUMP") ? fopen("atrac_dec.raw", "wb") : nullptr;
 	if (dec && out) fwrite(gptr(out), 1, samples * 4, dec);
-	static int n3; if (getenv("SSX_ATRACDBG") && n3++ < 60) rt_log(LOG_AUDIO, "DecodeData -> %u samples, readPos %x recv %x remain %d", samples, a->readPos, a->received, remain_frames(*a));
-	bool last = a->readPos + a->blockAlign > end && a->loopNum == 0;
+	static int n3; if (getenv("SSX_ATRACDBG") && n3++ < 60) rt_log(LOG_AUDIO, "DecodeData -> %u samples, readPos %x avail %x remain %d", samples, a->readPos, a->avail, remain_frames(*a));
+	bool last = a->readPos + a->blockAlign > a->dataEnd() && a->loopNum == 0;
 	finish(samples, last ? 1 : 0);
 	RET(0);
 }

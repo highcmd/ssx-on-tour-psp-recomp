@@ -131,9 +131,10 @@ static void read_color(const u8 *p, int fmt, float *c) {
 static inline void unpack_rgb(u32 v, float *c) { c[0] = v & 255; c[1] = (v >> 8) & 255; c[2] = (v >> 16) & 255; }
 
 // Lighting (world space), per PSP: emissive + ambient + sum of lights.
-static void light_vertex(const float *posW, const float *nrmW, float *col) {
+// The material-update bits only take the vertex colour when the vertex has one.
+static void light_vertex(const float *posW, const float *nrmW, float *col, bool hasColor) {
 	float matAmb[4], matDif[3], matSpe[3], emi[3], alc[3];
-	u32 mu = R[0x53];
+	u32 mu = hasColor ? R[0x53] : 0;
 	if (mu & 1) memcpy(matAmb, col, 16); else { unpack_rgb(R[0x55], matAmb); matAmb[3] = R[0x58] & 255; }
 	if (mu & 2) memcpy(matDif, col, 12); else unpack_rgb(R[0x56], matDif);
 	if (mu & 4) memcpy(matSpe, col, 12); else unpack_rgb(R[0x57], matSpe);
@@ -248,7 +249,7 @@ static Vtx transform_attrs(const VFormat &f, const u8 *p, float *pos, float *nrm
 	V4 c = mul44(projM, vp);
 	v.x = c.x; v.y = c.y; v.z = c.z; v.w = c.w;
 
-	if (on(0x17)) light_vertex(wp, wn, col);
+	if (on(0x17)) light_vertex(wp, wn, col, f.oC >= 0);
 	v.r = col[0]; v.g = col[1]; v.b = col[2]; v.a = col[3];
 
 	// texture coordinates
@@ -785,6 +786,8 @@ static void setup_pipe(bool through) {
 		p.writeMask = (p.clearColor ? 0 : 0x00FFFFFF) | (p.clearAlpha ? 0 : 0xFF000000);
 	} else {
 		p.writeMask = (R[0xe8] & 0xFFFFFF) | ((R[0xe9] & 255) << 24);
+		// alpha is the stencil: only clears and stencil ops change it (PPSSPP DrawPixel)
+		if (!p.stencil) p.writeMask |= 0xFF000000u;
 	}
 	if (g_render_scale > 1 && p.tgt.vfmt == 0) p.writeMask |= 0xFF000000u;   // 565: keep shadow alpha opaque
 	p.minZ = R[0xd6] & 0xFFFF; p.maxZ = R[0xd7] & 0xFFFF;
@@ -1518,10 +1521,15 @@ static void draw_prim(u32 op) {
 			for (auto vv : vs) { if (!f.through) to_screen(vv); bx0 = std::min(bx0, vv.sx); bx1 = std::max(bx1, vv.sx); by0 = std::min(by0, vv.sy); by1 = std::max(by1, vv.sy); }
 			rt_log(LOG_GE, "T   bbox %.0f,%.0f - %.0f,%.0f", bx0, by0, bx1, by1);
 		}
+		rt_log(LOG_GE, "T   light %d lights %d%d%d%d mu %x emi %06x amb %06x/%02x dif %06x spe %06x alc %06x/%02x lt0 %06x la0 %06x ld0 %06x | tfunc %06x tenv %06x fog %d col0 %.0f %.0f %.0f",
+		       on(0x17), on(0x18), on(0x19), on(0x1a), on(0x1b), R[0x53] & 7, R[0x54] & 0xFFFFFF, R[0x55] & 0xFFFFFF, R[0x58] & 0xFF,
+		       R[0x56] & 0xFFFFFF, R[0x57] & 0xFFFFFF, R[0x5c] & 0xFFFFFF, R[0x5d] & 0xFF, R[0x5f] & 0xFFFFFF, R[0x8f] & 0xFFFFFF, R[0x90] & 0xFFFFFF,
+		       R[0xc9] & 0xFFFFFF, R[0xca] & 0xFFFFFF, on(0x1f), a.r, a.g, a.b);
+		rt_log(LOG_GE, "T   fog1 %06x (%g) fog2 %06x (%g) fogcol %06x v0fog %.3f", R[0xcd] & 0xFFFFFF, f24(R[0xcd]), R[0xce] & 0xFFFFFF, f24(R[0xce]), R[0xcf] & 0xFFFFFF, a.fog);
 		rt_log(LOG_GE, "T   texaddr %08x bufw %u swz %u clut %06x cmode %06x", (R[0xa0] & 0xFFFFF0) | ((R[0xa8] & 0x0F0000) << 8), R[0xa8] & 0xFFFF, R[0xc2] & 1, (R[0xb0] & 0xFFFFF0) | ((R[0xb1] & 0x0F0000) << 8), R[0xc5]);
-		rt_log(LOG_GE, "T prim %d n %3d vt %06x thr %d tex %d fmt %u %ux%u zt %d/%d zw %d blend %d at %d cull %d tmap %u px %llu | v0 clip(%.1f %.1f %.1f %.1f) scr(%.0f %.0f %.0f) a %.0f",
-		       type, count, vt, f.through, P.tex, R[0xc3] & 15, P.tw, P.th, P.depthTest, P.zFunc, P.zWrite, P.blend, P.alphaTest, cullOn ? 1 + cullCCW : 0,
-		       R[0xc0] & 3, (unsigned long long)(t_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a);
+		rt_log(LOG_GE, "T prim %d n %3d vt %06x clr %d/%x thr %d tex %d fmt %u %ux%u zt %d/%d zw %d blend %d at %d cull %d tmap %u px %llu | v0 clip(%.1f %.1f %.1f %.1f) scr(%.0f %.0f %.0f) a %.0f rgb %.0f %.0f %.0f uv %.2f %.2f | v1 a %.0f",
+		       type, count, vt, P.clear, (R[0xd3] >> 8) & 7, f.through, P.tex, R[0xc3] & 15, P.tw, P.th, P.depthTest, P.zFunc, P.zWrite, P.blend, P.alphaTest, cullOn ? 1 + cullCCW : 0,
+		       R[0xc0] & 3, (unsigned long long)(t_pixels - px0), a.x, a.y, a.z, a.w, a.sx, a.sy, a.sz, a.a, a.r, a.g, a.b, a.u, a.v, count > 1 ? vs[1].a : -1.0f);
 	}
 }
 

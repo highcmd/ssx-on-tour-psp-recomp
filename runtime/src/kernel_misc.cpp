@@ -4,6 +4,7 @@
 #include <map>
 
 #include "kernel.h"
+#include "platform.h"
 
 int kernel_new_uid();
 
@@ -121,6 +122,13 @@ HLE(sceSuspendForUser, sceKernelVolatileMemLock) {
 	if (ARG(2)) SW(ARG(2), 0x00400000);
 	RET(0);
 }
+HLE(sceSuspendForUser, sceKernelVolatileMemTryLock) {
+	if (s_volatile_locked) { RET(0x802B0200); return; }
+	s_volatile_locked = true;
+	if (ARG(1)) SW(ARG(1), 0x08400000);
+	if (ARG(2)) SW(ARG(2), 0x00400000);
+	RET(0);
+}
 HLE(sceSuspendForUser, sceKernelVolatileMemUnlock) { s_volatile_locked = false; RET(0); }
 HLE(sceSuspendForUser, sceKernelPowerLock) { RET(0); }
 HLE(sceSuspendForUser, sceKernelPowerUnlock) { RET(0); }
@@ -152,6 +160,48 @@ HLE(sceRtc, sceRtcGetCurrentTick) {
 	SW(ARG(0) + 4, (u32)(t >> 32));
 	RET(0);
 }
+
+// ScePspDateTime: u16 year, month, day, hour, minute, second; u32 microsecond
+static void put_datetime(u32 p, const struct tm &t, u32 usec) {
+	SH(p, (u16)(t.tm_year + 1900)); SH(p + 2, (u16)(t.tm_mon + 1)); SH(p + 4, (u16)t.tm_mday);
+	SH(p + 6, (u16)t.tm_hour); SH(p + 8, (u16)t.tm_min); SH(p + 10, (u16)t.tm_sec);
+	SW(p + 12, usec);
+}
+static void current_clock(u32 p, bool local, int tzMinutes) {
+	struct timeval tv;
+	gettimeofday(&tv, nullptr);
+	time_t secs = tv.tv_sec + (time_t)tzMinutes * 60;
+	struct tm t;
+	if (local) platform_localtime(secs, &t); else t = *std::gmtime(&secs);
+	put_datetime(p, t, (u32)tv.tv_usec);
+}
+HLE(sceRtc, sceRtcGetCurrentClock) { current_clock(ARG(0), false, (int)ARG(1)); RET(0); }
+HLE(sceRtc, sceRtcGetCurrentClockLocalTime) { current_clock(ARG(0), true, 0); RET(0); }
+
+// datetime -> ticks (microseconds since 0001-01-01)
+HLE(sceRtc, sceRtcGetTick) {
+	u32 p = ARG(0);
+	int y = LH(p), mo = LH(p + 2), d = LH(p + 4);
+	// days from 0001-01-01 (proleptic Gregorian), via the civil-from-days inverse
+	y -= mo <= 2;
+	int era = (y >= 0 ? y : y - 399) / 400;
+	unsigned yoe = (unsigned)(y - era * 400);
+	unsigned doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+	unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	s64 days = (s64)era * 146097 + doe - 719468 + 719162;   // 1970-01-01 is day 719162
+	u64 t = ((u64)days * 86400 + LH(p + 6) * 3600 + LH(p + 8) * 60 + LH(p + 10)) * 1000000ull + LW(p + 12);
+	SW(ARG(1), (u32)t);
+	SW(ARG(1) + 4, (u32)(t >> 32));
+	RET(0);
+}
+HLE(sceRtc, sceRtcCompareTick) {
+	u64 a = LW(ARG(0)) | ((u64)LW(ARG(0) + 4) << 32), b = LW(ARG(1)) | ((u64)LW(ARG(1) + 4) << 32);
+	RET(a < b ? -1 : a > b ? 1 : 0);
+}
+
+HLE(UtilsForUser, sceKernelIcacheInvalidateAll) { RET(0); }   // overlays: see rt_call
+HLE(scePspNpDrm_user, sceNpDrmSetLicenseeKey) { RET(0); }
+HLE(scePspNpDrm_user, sceNpDrmEdataSetupKey) { RET(0); }
 
 // ------------------------------------------------------------- stdio
 HLE(StdioForUser, sceKernelStdin) { RET(0); }

@@ -127,3 +127,12 @@ SSX_VBTRACE_AT=s (vblank/GE/wait timeline)  SSX_GE_THREADS=n  --headless
 ## Licensing note
 `runtime/vfpu/` is ported from PPSSPP (GPL-2.0+), so the runtime is GPL-2.0+. Game data/code is never
 committed (see .gitignore).
+
+## Fixes from the GTA: Chinatown Wars port (2026-10-23)
+- GL: the shader always writes `gl_FragStencilRefARB` (once written anywhere it replaces
+  glStencilFunc's reference; unwritten = undefined), and the framebuffer alpha (= stencil) only changes
+  through clears and stencil ops, as in PPSSPP. Lighting: material-update bits need a vertex colour.
+- Kernel: zero timeout values time out at once; ExitDeleteThread / module_start free their stacks;
+  VBlank sub-interrupts; sysclock conversions; RTC clock functions; ATRAC streaming with seeking;
+  Output2; sceIoCloseAsync; PeekBufferPositive; `ms0:/PSP/SAVEDATA` created at start.
+- Checked: boot → race renders as before, music decodes continuously (32 s in 32 s).

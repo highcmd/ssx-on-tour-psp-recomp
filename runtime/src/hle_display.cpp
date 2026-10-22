@@ -438,6 +438,12 @@ HLE(sceDisplay, sceDisplayGetVcount) {
 	RET(s_vcount);
 }
 
+// Waits for the next vblank start, like WaitVblankStart (the game only uses it to pace itself).
+HLE(sceDisplay, sceDisplayWaitVblank) {
+	kernel_wait(WAIT_VBLANK, 0, 0, false);
+	RET(0);
+}
+
 HLE(sceDisplay, sceDisplayWaitVblankStart) {
 	static double vbTrace = getenv("SSX_VBTRACE_AT") ? atof(getenv("SSX_VBTRACE_AT")) : -1;
 	static int vbn;
@@ -451,7 +457,12 @@ HLE(sceDisplay, sceDisplayWaitVblankStart) {
 
 HLE(sceCtrl, sceCtrlSetSamplingMode) { RET(0); }
 
-HLE(sceCtrl, sceCtrlReadBufferPositive) {
+static void ctrl_fill(CPUState *c);
+HLE(sceCtrl, sceCtrlReadBufferPositive) { ctrl_fill(c); }
+HLE(sceCtrl, sceCtrlPeekBufferPositive) { ctrl_fill(c); }   // the latest sample, no wait either way
+HLE(sceCtrl, sceCtrlSetSamplingCycle) { RET(0); }
+
+static void ctrl_fill(CPUState *c) {
 	u32 p = ARG(0);
 	int n = (int)ARG(1);
 	static int calls;

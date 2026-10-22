@@ -107,7 +107,7 @@ void decode_vram(u32 addr, u32 stride, u32 fmt, int w, int h, std::vector<u32> &
 struct GeGL {
 	bool inited = false, failed = false;
 	GLuint prog = 0, vao = 0, vbo = 0;
-	GLint uMode, uMode2, uAlpha, uTexEnv, uFogColor, uFix, uZRange, uUVScale, uTex;
+	GLint uMode, uMode2, uAlpha, uTexEnv, uFogColor, uFix, uZRange, uUVScale, uTex, uStencilRef;
 	GLuint samplers[8];
 	std::map<u32, GLuint> depth;            // z buffer address -> D24S8 texture
 	std::map<u64, GLuint> fbos;             // (colorTex << 32 | depthTex) -> FBO
@@ -138,6 +138,7 @@ uniform vec3 uTexEnv;
 uniform vec3 uFogColor;
 uniform vec3 uFix;
 uniform vec2 uZRange;
+uniform int uStencilRef;   // with stencil export the shader's value replaces glStencilFunc's ref
 uniform vec2 uUVScale;
 out vec4 fragColor;
 
@@ -184,12 +185,15 @@ void main() {
 	}
 	fragColor = c;
 #ifdef STENCIL_EXPORT
+	// Once a shader writes gl_FragStencilRefARB, the stencil test and REPLACE use that value
+	// in every invocation (undefined where it is not written): always write it.
+	int s = uStencilRef;
 	if (uAlpha.z != 0) {
-		int s = int(c.a * 255.0 + 0.5);
+		s = int(c.a * 255.0 + 0.5);
 		if (uAlpha.z == 2) s = s >= 128 ? 255 : 0;
 		else if (uAlpha.z == 3) s = (s >> 4) * 17;
-		gl_FragStencilRefARB = s;
 	}
+	gl_FragStencilRefARB = s;
 #endif
 }
 )";
@@ -219,6 +223,7 @@ bool ge_init() {
 	G.uAlpha = glGetUniformLocation(G.prog, "uAlpha");
 	G.uTexEnv = glGetUniformLocation(G.prog, "uTexEnv");
 	G.uFogColor = glGetUniformLocation(G.prog, "uFogColor");
+	G.uStencilRef = glGetUniformLocation(G.prog, "uStencilRef");
 	G.uFix = glGetUniformLocation(G.prog, "uFix");
 	G.uZRange = glGetUniformLocation(G.prog, "uZRange");
 	G.uUVScale = glGetUniformLocation(G.prog, "uUVScale");
@@ -435,7 +440,9 @@ void gl_ge_draw(const GLDrawState &st, const GLVert *v, int count) {
 	int stencilExport = 0;
 	int exportKind = st.fbFmt == 1 ? 2 : st.fbFmt == 2 ? 3 : 1;
 	u32 m = st.writeMask;
-	bool aWrite = fbHasAlpha && (m >> 24) != 0xFF;
+	// The PSP keeps stencil in the framebuffer alpha and only changes it through clears and
+	// stencil ops: without the stencil test, drawing leaves alpha alone (PPSSPP DrawPixel).
+	bool aWrite = fbHasAlpha && (m >> 24) != 0xFF && (st.clear || st.stencil);
 	if (st.clear) {
 		glDisable(GL_BLEND);
 		bool cc = st.clearColor, ca = st.clearAlpha && fbHasAlpha;
@@ -519,6 +526,7 @@ void gl_ge_draw(const GLDrawState &st, const GLVert *v, int count) {
 	glUniform3f(G.uFix, fix[0], fix[1], fix[2]);
 	glUniform2f(G.uZRange, (float)st.minZ, (float)st.maxZ);
 	glUniform2f(G.uUVScale, uvsx, uvsy);
+	glUniform1i(G.uStencilRef, st.stencil ? (int)(st.stRef & 0xFF) : 0);
 
 	glBindBuffer(GL_ARRAY_BUFFER, G.vbo);
 	size_t bytes = (size_t)count * sizeof(GLVert);
@@ -679,6 +687,40 @@ void present_thread() {
 			glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
 			glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 			write_ppm(shot, px, srcW, srcH);   // GL row 0 = PSP top row
+			if (getenv("SSX_DUMP_RT")) {   // debug: every colour target next to the shot
+				std::vector<std::pair<u32, GLuint>> all;
+				{
+					std::lock_guard<std::mutex> lk(g_tmtx);
+					for (auto &[a, t] : g_color) if (t.tex) all.push_back({a, t.tex});
+				}
+				for (auto &[a, t] : all) {
+					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+					glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);
+					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+					int w = 512 * g_render_scale, h = 512 * g_render_scale;
+					px.assign((size_t)w * h, 0);
+					glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+					char name[64];
+					snprintf(name, sizeof(name), "_rt%08x.ppm", a);
+					write_ppm(shot + name, px, w, h);
+				}
+				for (auto &[za, dt] : G.depth) {   // stencil as grey
+					glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);
+					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, dt, 0);
+					int w = 512 * g_render_scale, h = 512 * g_render_scale;
+					std::vector<u8> sb((size_t)w * h);
+					glPixelStorei(GL_PACK_ALIGNMENT, 1);
+					glReadPixels(0, 0, w, h, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, sb.data());
+					glPixelStorei(GL_PACK_ALIGNMENT, 4);
+					for (size_t i = 0; i < sb.size(); i++) px[i] = sb[i] * 0x010101u;
+					char name[64];
+					snprintf(name, sizeof(name), "_st%08x.ppm", za);
+					write_ppm(shot + name, px, w, h);
+					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+				}
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+			}
 		}
 		lastSerial = serial;
 		lastFb = req.fb;

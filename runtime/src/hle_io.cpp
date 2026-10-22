@@ -324,7 +324,11 @@ static s64 do_read(int fd, u32 buf, u32 size) {
 
 HLE(IoFileMgrForUser, sceIoRead) {
 	s64 r = do_read((int)ARG(0), ARG(1), ARG(2));
-	if (rt_log_enabled(LOG_IO)) LOGIO("read(%d, %08x, %x) -> %llx", (int)ARG(0), ARG(1), ARG(2), (long long)r);
+	if (!ARG(1) && ARG(2)) {   // a read into NULL: usually a failed allocation in the game
+		void rt_log_backtrace(CPUState *, u32);
+		rt_log_backtrace(c, 256);
+	}
+	if (rt_log_enabled(LOG_IO)) LOGIO("read(%d, %08x, %x) -> %llx ra=%08x", (int)ARG(0), ARG(1), ARG(2), (long long)r, c->r[31]);
 	RET((u32)r);
 }
 
@@ -374,6 +378,18 @@ static void async_result(CPUState *c, bool wait) {
 	SW(ARG(1), (u32)it->second.asyncResult);
 	SW(ARG(1) + 4, (u32)(it->second.asyncResult >> 32));
 	it->second.asyncPending = false;
+	if (!it->second.f && !it->second.isDir) s_files.erase(it);   // sceIoCloseAsync done: fd is free
+	RET(0);
+}
+
+// sceIoCloseAsync: close now; the fd stays until its async result (0) is collected.
+HLE(IoFileMgrForUser, sceIoCloseAsync) {
+	auto it = s_files.find((int)ARG(0));
+	if (it == s_files.end() || !it->second.f) { RET(SCE_ERROR_ERRNO_BAD_FD); return; }
+	fclose(it->second.f);
+	it->second.f = nullptr;
+	it->second.asyncResult = 0;
+	it->second.asyncPending = true;
 	RET(0);
 }
 HLE(IoFileMgrForUser, sceIoWaitAsync) { async_result(c, true); }

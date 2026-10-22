@@ -158,6 +158,20 @@ void rt_call(CPUState *c, u32 addr) {
 	rt_unhandled(c, addr, "indirect call to unknown address");
 }
 
+// Return addresses on the guest stack: words just after a jal/jalr in the executable.
+// No frame information, so stale slots can appear; good enough to see who called.
+void rt_log_backtrace(CPUState *c, u32 words) {
+	u32 sp = c->r[29];
+	rt_log(LOG_RT, "backtrace: ra=%08x", c->r[31]);
+	for (u32 i = 0; i < words; i++) {
+		u32 v = LW(sp + 4 * i);
+		if (v & 3 || !find_containing(v - 8)) continue;
+		u32 call = LW(v - 8);
+		if ((call >> 26) == 3 || (call & 0xFC00003F) == 9)
+			rt_log(LOG_RT, "  sp+%03x: %08x (in %08x)", 4 * i, v, find_containing(v - 8)->start);
+	}
+}
+
 bool rt_is_function(u32 addr) { return s_func_by_addr.count(addr & 0x3FFFFFFF) != 0; }
 
 void rt_unhandled(CPUState *c, u32 pc, const char *what) {

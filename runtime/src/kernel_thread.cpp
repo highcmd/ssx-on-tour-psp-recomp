@@ -400,7 +400,14 @@ void kernel_exit_current_thread(u32 code) {
 	t->status = Thread::DORMANT;
 	t->wait = WAIT_NONE;
 	kernel_wake_where(WAIT_THREADEND, t->id, code);
-	fiber_switch(t->fiber, s_sched_fiber);  // never resumed; StartThread makes a new fiber
+	Fiber *f = t->fiber;
+	if (t->attr & 0x40000000) {   // ExitDeleteThread, or module_start returning: free it now
+		t->fiber = nullptr;
+		s_dead_fibers.push_back(f);   // destroyed by the scheduler once we have left it
+		kernel_free(t->stackAddr);
+		s_threads.erase(t->id);
+	}
+	fiber_switch(f, s_sched_fiber);  // never resumed; StartThread makes a new fiber
 	abort();
 }
 
@@ -440,12 +447,15 @@ void kernel_notify_callback(int cbid, u32 arg) {
 // ------------------------------------------------------------- scheduler loop
 void kernel_start_module(u32 entry) {
 	// The PSP runs module_start in a fresh thread; SDK crt0 then creates "user_main".
-	int id = kernel_create_thread("module_start", entry, 0x20, 0x40000, 0x80000000);
+	// ModuleMgr deletes that thread once module_start returns, which frees its stack.
+	int id = kernel_create_thread("module_start", entry, 0x20, 0x40000, 0x80000000 | 0x40000000);
 	kernel_start_thread(id, 0, 0);
 }
 
+void intr_on_vblank();
 static void vblank_tick(u64 when) {
 	display_on_vblank();
+	intr_on_vblank();
 	kernel_wake_where(WAIT_VBLANK, 0, 0);
 	kernel_schedule(when + VBLANK_US, [when] { vblank_tick(when + VBLANK_US); });
 }
@@ -495,7 +505,9 @@ void kernel_run() {
 }
 
 // =============================================================== HLE: threads
-static u32 timeout_from_ptr(u32 p) { return p ? LW(p) : 0; }
+// A timeout pointer holding 0 times out at once (the PSP writes 0 there after a timeout,
+// and games reuse the variable); kernel_wait takes 0 as "no timeout", so pass 1 us.
+static u32 timeout_from_ptr(u32 p) { return p ? std::max<u32>(LW(p), 1) : 0; }
 
 HLE(ThreadManForUser, sceKernelCreateThread) {
 	int prio = (int)ARG(2);
@@ -577,6 +589,11 @@ HLE(ThreadManForUser, sceKernelDelayThreadCB) {
 HLE(ThreadManForUser, sceKernelSleepThread) {
 	if (s_cur->wakeupCount) { s_cur->wakeupCount--; RET(0); return; }
 	RET(kernel_wait(WAIT_SLEEP, 0, 0, false));
+}
+
+HLE(ThreadManForUser, sceKernelSleepThreadCB) {
+	if (s_cur->wakeupCount) { s_cur->wakeupCount--; RET(0); return; }
+	RET(kernel_wait(WAIT_SLEEP, 0, 0, true));
 }
 
 HLE(ThreadManForUser, sceKernelWakeupThread) {
@@ -835,3 +852,26 @@ HLE(ThreadManForUser, sceKernelGetSystemTime) {
 	RET(0);
 }
 HLE(ThreadManForUser, sceKernelGetSystemTimeWide) { RET64(rt_time_us()); }
+
+// The system clock counts microseconds: the conversions are splits and copies.
+static void sysclock_to_usec(u64 t, u32 secPtr, u32 usecPtr) {
+	if (secPtr) {
+		SW(secPtr, (u32)(t / 1000000));
+		if (usecPtr) SW(usecPtr, (u32)(t % 1000000));
+	} else if (usecPtr) {
+		SW(usecPtr, (u32)t);
+	}
+}
+HLE(ThreadManForUser, sceKernelUSec2SysClockWide) { RET64(ARG(0)); }
+HLE(ThreadManForUser, sceKernelUSec2SysClock) {
+	if (ARG(1)) { SW(ARG(1), ARG(0)); SW(ARG(1) + 4, 0); }
+	RET(0);
+}
+HLE(ThreadManForUser, sceKernelSysClock2USecWide) {
+	sysclock_to_usec(((u64)ARG(1) << 32) | ARG(0), ARG(2), ARG(3));
+	RET(0);
+}
+HLE(ThreadManForUser, sceKernelSysClock2USec) {
+	sysclock_to_usec(((u64)LW(ARG(0) + 4) << 32) | LW(ARG(0)), ARG(1), ARG(2));
+	RET(0);
+}

@@ -102,6 +102,10 @@ int main(int argc, char **argv) {
 
 	rt_log_init();
 	rt_log(LOG_RT, "UMD: %s", g_umd_root.empty() ? g_iso_path.c_str() : g_umd_root.c_str());
+	{   // an inserted, formatted memory stick: games probe ms0:/ and PSP/SAVEDATA
+		std::error_code ec;
+		std::filesystem::create_directories(u8p(g_ms_root + "/PSP/SAVEDATA"), ec);
+	}
 	memory_init();
 	if (!memory_load_image(image.c_str())) {
 		fprintf(stderr, "cannot load %s\n", image.c_str());
