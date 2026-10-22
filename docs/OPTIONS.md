@@ -22,7 +22,8 @@ In `ssx.ini`, write `key = value`, one per line; `#` starts a comment. On the co
 | `fps` | `--fps N` | `30`, `60`, `120` | `30` | game frame rate, see [Frame rate](#frame-rate) |
 | `resolution` (or `res`) | `--res WxH` | e.g. `1920x1080` | `960x544` | window size |
 | `scale` | `--scale N` | `1`, `2`, … | none | shorthand for a window of 480·N × 272·N |
-| `fullscreen` | `--fullscreen` / `--windowed` | `true`/`false` | `false` | borderless fullscreen at the desktop resolution; F11 toggles it while playing |
+| `fullscreen` | `--fullscreen` / `--windowed` | `true`/`false` | `false` | fullscreen; F11 toggles it while playing |
+| `refresh` | `--refresh HZ` | `0` or Hz | `0` | with `fullscreen`: `0` = borderless at the desktop mode; a rate switches the monitor to `resolution` at that rate, see [Fullscreen](#fullscreen-and-refresh-rate) |
 | `renderer` | `--renderer R` | `gl`, `software` | `gl` | `gl` = GPU (OpenGL 3.3); `software` = CPU reference renderer |
 | `render_scale` | `--render-scale N` | `0`–`6` | `0` (auto) | internal resolution, see [Resolution](#resolution) |
 | `filter` | `--filter F` | `linear`, `nearest` | `linear` | filter used to fit the picture into the window |
@@ -71,6 +72,29 @@ The GPU cost grows with N². On an integrated AMD Radeon ("Phoenix" APU), N = 4 
 N = 6 holds 60. The `software` renderer is much slower (about 60 fps at N = 1 and 18 fps at N = 3) and is
 there as a reference.
 
+### Fullscreen and refresh rate
+
+Fullscreen comes in two kinds:
+
+- **Borderless** (`refresh = 0`, the default): the window covers the screen and the monitor stays at
+  the desktop's resolution and refresh rate. Switching in and out (F11) is instant.
+- **Exclusive** (`refresh = 144`, for example): the monitor switches to `resolution` at that refresh
+  rate, or the closest mode it supports. `ssx.log` shows the mode it got
+  (`fullscreen mode 2560x1440 @ 144 Hz`). Use it to run the game at a refresh rate other than the
+  desktop's, such as 120 Hz with `fps = 120` and `vsync = true` for smooth motion without tearing.
+
+```ini
+fullscreen = true
+resolution = 2560x1440
+refresh = 120
+fps = 120
+vsync = true
+```
+
+The launcher lists the refresh rates your monitor offers for the chosen size. On Linux under
+Wayland, compositors don't let programs change the mode, so exclusive fullscreen behaves like
+borderless there.
+
 ### Frame rate
 
 On the PSP, the game runs races at 30 fps. Its simulation is time-based (each tick advances by
@@ -79,7 +103,8 @@ behaviour. Menus are not affected.
 
 The rider's speed, physics and race timer stay correct at every setting; the race timer was
 verified 1:1 with the wall clock at 60 and 120. If you see tearing, turn on `vsync`. With
-vsync on, a monitor refresh below the chosen rate caps the frame rate.
+vsync on, a monitor refresh below the chosen rate caps the frame rate. For 120 fps without tearing,
+use a 120 Hz (or faster) mode, see [Fullscreen](#fullscreen-and-refresh-rate).
 
 ### Gamepads
 

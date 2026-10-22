@@ -13,7 +13,7 @@ import json, locale, os, pathlib, platform, queue, shutil, subprocess, sys, thre
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 FROZEN = getattr(sys, "frozen", False)
 IS_WIN = os.name == "nt"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -43,7 +43,8 @@ TEXT = {
         "filter": "Scaling", "filter_linear": "Smooth", "filter_nearest": "Sharp pixels",
         "renderer": "Renderer", "renderer_gl": "GPU (OpenGL)", "renderer_sw": "CPU (slow, reference)",
         "monitor": "Monitor: {w}×{h}{hz}",
-        "fps_hint": "Your monitor refreshes at {hz} Hz: with VSync on, the game runs at most {hz} fps.",
+        "refresh": "Refresh rate", "refresh_desktop": "Desktop (borderless)",
+        "fps_hint": "The screen refreshes at {hz} Hz: with VSync on, the game runs at most {hz} fps.",
         "psp": "PSP button", "key": "Keyboard", "key2": "Keyboard (2nd)", "pad": "Gamepad", "pad2": "Gamepad (2nd)",
         "press_key": "Press a key… (Esc = none)", "none": "—",
         "deadzone": "Left stick dead zone", "rstick": "Right stick also works as the D-pad",
@@ -77,7 +78,8 @@ TEXT = {
         "filter": "Skalowanie", "filter_linear": "Gładkie", "filter_nearest": "Ostre piksele",
         "renderer": "Renderer", "renderer_gl": "GPU (OpenGL)", "renderer_sw": "CPU (wolny, referencyjny)",
         "monitor": "Monitor: {w}×{h}{hz}",
-        "fps_hint": "Twój monitor odświeża {hz} Hz: z włączonym VSync gra działa najwyżej w {hz} fps.",
+        "refresh": "Odświeżanie", "refresh_desktop": "Pulpit (bez ramki)",
+        "fps_hint": "Ekran odświeża {hz} Hz: z włączonym VSync gra działa najwyżej w {hz} fps.",
         "psp": "Przycisk PSP", "key": "Klawiatura", "key2": "Klawiatura (2.)", "pad": "Pad", "pad2": "Pad (2.)",
         "press_key": "Naciśnij klawisz… (Esc = brak)", "none": "—",
         "deadzone": "Martwa strefa lewej gałki", "rstick": "Prawa gałka działa też jako krzyżak",
@@ -235,8 +237,10 @@ def write_ini(path, values):
 
 
 def monitor_info(root):
+    """(width, height, refresh Hz or None, {"WxH": {Hz, ...}}) of the primary monitor."""
     w, h = root.winfo_screenwidth(), root.winfo_screenheight()
     hz = None
+    modes = {}
     if IS_WIN:
         try:
             import ctypes
@@ -256,8 +260,14 @@ def monitor_info(root):
                             ("dmDisplayFrequency", wintypes.DWORD)]
             dm = DEVMODEW()
             dm.dmSize = ctypes.sizeof(DEVMODEW)
-            if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)):
+            enum = ctypes.windll.user32.EnumDisplaySettingsW
+            if enum(None, -1, ctypes.byref(dm)):   # ENUM_CURRENT_SETTINGS
                 w, h, hz = dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency or None
+            i = 0
+            while enum(None, i, ctypes.byref(dm)):
+                if dm.dmBitsPerPel == 32 and dm.dmDisplayFrequency > 1:
+                    modes.setdefault(f"{dm.dmPelsWidth}x{dm.dmPelsHeight}", set()).add(dm.dmDisplayFrequency)
+                i += 1
         except Exception:
             pass
     else:
@@ -269,16 +279,27 @@ def monitor_info(root):
             for line in out.splitlines():
                 m = re.match(r"\S+ connected (primary )?(\d+)x(\d+)\+", line)
                 if m:
-                    cur = [bool(m.group(1)), int(m.group(2)), int(m.group(3)), None]
+                    cur = [bool(m.group(1)), int(m.group(2)), int(m.group(3)), None, {}]
                     outputs.append(cur)
-                elif cur and cur[3] is None and "*" in line:
-                    cur[3] = round(float(next(t for t in line.split() if "*" in t).strip("*+")))
+                elif not line.startswith(" "):
+                    cur = None
+                elif cur:
+                    toks = line.split()
+                    if toks and re.match(r"\d+x\d+i?$", toks[0]) and not toks[0].endswith("i"):
+                        for t in toks[1:]:
+                            try:
+                                r = round(float(t.strip("*+")))
+                            except ValueError:
+                                continue
+                            cur[4].setdefault(toks[0], set()).add(r)
+                            if "*" in t:
+                                cur[3] = r
             if outputs:
                 best = next((o for o in outputs if o[0]), outputs[0])
-                w, h, hz = best[1], best[2], best[3]
+                w, h, hz, modes = best[1], best[2], best[3], best[4]
         except Exception:
             pass
-    return w, h, hz
+    return w, h, hz, modes
 
 
 def open_path(p):
@@ -416,18 +437,28 @@ class Launcher:
         f = ttk.Frame(nb, padding=16)
         nb.add(f, text=L["tab_display"])
         f.columnconfigure(1, weight=1)
-        w, h, hz = self.mon
+        w, h, hz, _ = self.mon
         ttk.Label(f, text=L["monitor"].format(w=w, h=h, hz=f" @ {hz} Hz" if hz else "")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         self.res_var = tk.StringVar()
         self.desktop_label = f"{L['desktop']} ({w}x{h})"
-        res = [r for r in RESOLUTIONS if int(r.split("x")[0]) <= w and int(r.split("x")[1]) <= h]
+        res = set(r for r in RESOLUTIONS if int(r.split("x")[0]) <= w and int(r.split("x")[1]) <= h)
+        res |= {r for r in self.mon[3] if int(r.split("x")[0]) >= 800 and int(r.split("x")[1]) >= 450}
+        res = sorted(res, key=lambda r: tuple(int(x) for x in r.split("x")))
         ttk.Label(f, text=L["resolution"]).grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Combobox(f, textvariable=self.res_var, values=[self.desktop_label] + res, state="readonly",
-                     width=24).grid(row=1, column=1, sticky="w")
+        rc = ttk.Combobox(f, textvariable=self.res_var, values=[self.desktop_label] + res, state="readonly", width=24)
+        rc.grid(row=1, column=1, sticky="w")
+        rc.bind("<<ComboboxSelected>>", lambda e: self.update_refresh())
+        fr = ttk.Frame(f)
+        fr.grid(row=2, column=1, sticky="w", pady=4)
         self.fs_var = tk.BooleanVar()
-        ttk.Checkbutton(f, text=L["fullscreen"], variable=self.fs_var).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(fr, text=L["fullscreen"], variable=self.fs_var, command=self.update_refresh).pack(side="left")
+        ttk.Label(fr, text="   " + L["refresh"]).pack(side="left")
+        self.refresh_var = tk.StringVar()
+        self.refresh_cb = ttk.Combobox(fr, textvariable=self.refresh_var, state="readonly", width=22)
+        self.refresh_cb.pack(side="left", padx=6)
+        self.refresh_cb.bind("<<ComboboxSelected>>", lambda e: self.update_hint())
 
         ttk.Label(f, text=L["fps"]).grid(row=3, column=0, sticky="w", pady=(12, 4))
         fr = ttk.Frame(f)
@@ -545,10 +576,12 @@ class Launcher:
     def load_settings(self):
         ini = read_ini(self.p.ini)
         first = not self.p.ini.exists()
-        w, h, hz = self.mon
+        w, h, hz, _ = self.mon
         res = ini.get("resolution", f"{w}x{h}" if first else "960x544")
         self.res_var.set(self.desktop_label if res == f"{w}x{h}" else res)
         self.fs_var.set(ini.get("fullscreen", "true" if first else "false") in ("1", "true", "on", "yes"))
+        r = ini.get("refresh", "0")
+        self.refresh_var.set(f"{r} Hz" if r.isdigit() and int(r) > 0 else L["refresh_desktop"])
         self.fps_var.set(ini.get("fps", "60" if first else "30"))
         self.vsync_var.set(ini.get("vsync", "true" if first else "false") in ("1", "true", "on", "yes"))
         try:
@@ -576,16 +609,15 @@ class Launcher:
         self.dz_var.set(round(dz * 100 / 32767))
         self.dz_label.configure(text=f"{self.dz_var.get()} %")
         self.rstick_var.set(ini.get("right_stick_dpad", "false") in ("1", "true", "on", "yes"))
-        self.update_hint()
+        self.update_refresh()
 
     def save_settings(self):
         ini = read_ini(self.p.ini)   # keep keys the launcher doesn't know (pad_mapping, …)
-        res = self.res_var.get()
-        if res.startswith(L["desktop"]):
-            res = f"{self.mon[0]}x{self.mon[1]}"
+        res = self.current_res()
         b = lambda v: "true" if v else "false"
         ini.update({
             "fps": self.fps_var.get(), "resolution": res, "fullscreen": b(self.fs_var.get()),
+            "refresh": str(self.refresh_hz()),
             "vsync": b(self.vsync_var.get()), "render_scale": str(self.scale_choices.index(self.scale_var.get())),
             "filter": self.filter_var.get(), "renderer": self.renderer_var.get(),
             "deadzone": str(self.dz_raw if self.dz_var.get() == round(self.dz_raw * 100 / 32767)
@@ -602,8 +634,27 @@ class Launcher:
             ini["iso"] = self.state["iso"]
         write_ini(self.p.ini, ini)
 
+    def current_res(self):
+        res = self.res_var.get()
+        return f"{self.mon[0]}x{self.mon[1]}" if res.startswith(L["desktop"]) else res
+
+    def refresh_hz(self):
+        v = self.refresh_var.get()
+        return int(v.split()[0]) if v and v[0].isdigit() else 0
+
+    def update_refresh(self):
+        """Refresh rates the monitor offers at the chosen size; only with fullscreen."""
+        rates = sorted(self.mon[3].get(self.current_res(), set()), reverse=True)
+        values = [L["refresh_desktop"]] + [f"{r} Hz" for r in rates]
+        self.refresh_cb.configure(values=values, state="readonly" if self.fs_var.get() else "disabled")
+        if self.refresh_var.get() not in values:
+            want = self.refresh_hz()
+            near = min(rates, key=lambda r: abs(r - want)) if want and rates else None
+            self.refresh_var.set(f"{near} Hz" if near else L["refresh_desktop"])
+        self.update_hint()
+
     def update_hint(self):
-        hz = self.mon[2]
+        hz = self.refresh_hz() if self.fs_var.get() and self.refresh_hz() else self.mon[2]
         if hz and self.vsync_var.get() and int(self.fps_var.get() or 30) > hz:
             self.hint.configure(text=L["fps_hint"].format(hz=hz))
         else:

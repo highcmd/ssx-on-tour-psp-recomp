@@ -5,6 +5,7 @@ resolution = 1440x816  # window size; the PSP picture keeps its 480:272 aspect r
 renderer = gl          # gl (GPU, default) or software (CPU reference)
 render_scale = 0       # internal resolution 480x272 x N; 0 = match the window height (816 -> 3)
 fullscreen = false     # F11 toggles at run time
+refresh = 0            # fullscreen: 0 = borderless at the desktop mode; e.g. 144 = switch the monitor to resolution @ 144 Hz
 filter = linear        # linear (smooth) or nearest (sharp pixels)
 vsync = false
 deadzone = 8000        # gamepad left-stick deadzone, 0..32767

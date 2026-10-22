@@ -37,6 +37,24 @@ static void open_pad(int index) {
 	rt_log(LOG_DISPLAY, "gamepad connected: %s", SDL_GameControllerName(p));
 }
 
+// Fullscreen as configured: exclusive at resolution @ refresh (the closest mode the
+// monitor has), or borderless at the desktop mode.
+static void enter_fullscreen() {
+	const Settings &st = g_settings;
+	if (st.refresh > 0) {
+		SDL_DisplayMode want{0, st.width, st.height, st.refresh, nullptr}, got;
+		int disp = std::max(0, SDL_GetWindowDisplayIndex(s_win));
+		if (SDL_GetClosestDisplayMode(disp, &want, &got) && SDL_SetWindowDisplayMode(s_win, &got) == 0 &&
+		    SDL_SetWindowFullscreen(s_win, SDL_WINDOW_FULLSCREEN) == 0) {
+			rt_log(LOG_DISPLAY, "fullscreen mode %dx%d @ %d Hz (asked for %dx%d @ %d Hz)", got.w, got.h,
+			       got.refresh_rate, st.width, st.height, st.refresh);
+			return;
+		}
+		rt_log_error("no %dx%d @ %d Hz mode (%s); using desktop fullscreen", st.width, st.height, st.refresh, SDL_GetError());
+	}
+	SDL_SetWindowFullscreen(s_win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+}
+
 void display_init(bool headless) {
 	s_headless = headless;
 	const Settings &st = g_settings;
@@ -56,7 +74,8 @@ void display_init(bool headless) {
 	if (!st.padMapping.empty() && SDL_GameControllerAddMapping(st.padMapping.c_str()) < 0)
 		rt_log_error("pad_mapping rejected: %s", SDL_GetError());
 	g_render_scale = settings_render_scale();
-	u32 flags = SDL_WINDOW_RESIZABLE | (st.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	const bool exclusive = st.fullscreen && st.refresh > 0;
+	u32 flags = SDL_WINDOW_RESIZABLE | (st.fullscreen && !exclusive ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 	if (wantGL) {
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -67,6 +86,7 @@ void display_init(bool headless) {
 		flags |= SDL_WINDOW_OPENGL | (headless ? SDL_WINDOW_HIDDEN : 0);
 	}
 	s_win = SDL_CreateWindow("SSX On Tour (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, st.width, st.height, flags);
+	if (s_win && exclusive && !headless) enter_fullscreen();
 	if (wantGL && s_win && gl_display_init(s_win, headless, st.vsync, st.linear)) {
 		s_gl = true;
 	} else {
@@ -346,8 +366,8 @@ void display_pump_events() {
 				}
 		}
 		if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11) {
-			bool fs = SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
-			SDL_SetWindowFullscreen(s_win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+			if (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN) SDL_SetWindowFullscreen(s_win, 0);
+			else enter_fullscreen();
 		}
 	}
 	update_buttons();

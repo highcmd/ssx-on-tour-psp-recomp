@@ -69,7 +69,8 @@ the game into C++ and builds it. At run time the game reads its files straight f
 - Native x86-64 code, translated ahead of time from the game's MIPS (Allegrex) executable
 - Rendering on the GPU (OpenGL 3.3) at a real internal resolution of up to 2880×1632
   (`--render-scale 1..6`), not an upscaled 480×272 image
-- 30 (original), 60 or 120 fps in races, with physics and race timing kept correct
+- 30 (original), 60 or 120 fps in races, with physics and race timing kept correct; exclusive
+  fullscreen at a chosen refresh rate (e.g. 120/144 Hz)
 - Linux and Windows x64 builds
 - A launcher with settings for resolution, frame rate and controls (remappable keys and pad buttons)
 - Xbox-style gamepads (hot-plug) and the keyboard

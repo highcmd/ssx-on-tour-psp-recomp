@@ -9,7 +9,8 @@ struct Settings {
 	int height = 544;
 	int renderScale = 0;
 	std::string renderer = "gl";   // gl (GPU) or software       // internal resolution = 480x272 * scale; 0 = match the window height
-	bool fullscreen = false;   // borderless desktop fullscreen
+	bool fullscreen = false;   // borderless desktop fullscreen, or exclusive with refresh > 0
+	int refresh = 0;           // exclusive fullscreen at resolution @ refresh Hz; 0 = keep the desktop mode
 	bool linear = true;        // scaling filter: linear (smooth) or nearest (sharp pixels)
 	bool vsync = false;        // host vsync on present
 	int deadzone = 8000;       // gamepad stick deadzone (0..32767)
